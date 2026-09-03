@@ -1,0 +1,22 @@
+set(CPM_DOWNLOAD_VERSION 0.42.0)
+set(CPM_DOWNLOAD_LOCATION "${CMAKE_BINARY_DIR}/cmake/CPM_${CPM_DOWNLOAD_VERSION}.cmake")
+
+if(NOT EXISTS "${CPM_DOWNLOAD_LOCATION}")
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/cmake")
+    file(DOWNLOAD
+        "https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake"
+        "${CPM_DOWNLOAD_LOCATION}"
+        STATUS CPM_DOWNLOAD_STATUS
+        TLS_VERIFY ON
+        TIMEOUT 60
+        INACTIVITY_TIMEOUT 20
+    )
+    list(GET CPM_DOWNLOAD_STATUS 0 CPM_DOWNLOAD_ERROR)
+    if(NOT CPM_DOWNLOAD_ERROR EQUAL 0)
+        file(REMOVE "${CPM_DOWNLOAD_LOCATION}")
+        list(GET CPM_DOWNLOAD_STATUS 1 CPM_DOWNLOAD_MESSAGE)
+        message(FATAL_ERROR "Failed to download CPM.cmake: ${CPM_DOWNLOAD_MESSAGE}")
+    endif()
+endif()
+
+include("${CPM_DOWNLOAD_LOCATION}")

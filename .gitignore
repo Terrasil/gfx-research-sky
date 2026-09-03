@@ -1,0 +1,6 @@
+.idea/
+.cpm-cache/
+thirdparty/
+cmake-build-*/
+out/
+results/
