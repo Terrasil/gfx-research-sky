@@ -1,4 +1,5 @@
 #include <gfx/research/application.hpp>
+#include <gfx/research/assets.hpp>
 #include <gfx/research/csv_writer.hpp>
 #include <gfx/research/framebuffer.hpp>
 #include <gfx/research/fullscreen_triangle.hpp>
@@ -14,10 +15,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <initializer_list>
 #include <utility>
 #include <iostream>
 #include <limits>
@@ -39,17 +40,30 @@
 #include <glm/vec4.hpp>
 
 namespace {
-    constexpr std::array<const char*, 3> SKY_MODE_LABELS = {
+    constexpr std::array<const char*, 4> SKY_MODE_LABELS = {
         "Day clouds",
         "Night clouds",
-        "Aurora"
+        "Aurora",
+        "Synthetic world field"
     };
 
-    constexpr std::array<const char*, 3> SKY_MODE_IDS = {
+    constexpr std::array<const char*, 4> SKY_MODE_IDS = {
         "day-clouds",
         "night-clouds",
-        "aurora"
+        "aurora",
+        "world-field"
     };
+
+    constexpr std::array<const char*, 3> METHOD_LABELS = {
+        "Direction-only",
+        "Fixed world sphere (legacy)",
+        "Per-origin virtual sphere"
+    };
+
+    constexpr int METHOD_DIRECTION_ONLY = 0;
+    constexpr int METHOD_FIXED_DOMAIN = 1;
+    constexpr int METHOD_PER_ORIGIN_SPHERE = 2;
+    constexpr int METHOD_EXPLICIT_POSITION_REFERENCE = 3;
 
     struct LaunchOptions {
         bool publicationSuite = false;
@@ -59,10 +73,14 @@ namespace {
 
     struct PublicationCase {
         std::string pairId;
+        std::string groupId;
         std::string sweep;
         int step = 0;
+        int repeat = 0;
         int skyMode = 0;
-        bool proposed = false;
+        int method = METHOD_PER_ORIGIN_SPHERE;
+        bool reflectionsEnabled = true;
+        bool quality = false;
         bool nullTest = false;
         int targetWidth = 1920;
         int targetHeight = 1080;
@@ -75,6 +93,7 @@ namespace {
     };
 
     struct ValidationResult {
+        double worldPositionRmse = std::numeric_limits<double>::quiet_NaN();
         double backgroundHitError = std::numeric_limits<double>::quiet_NaN();
         double reflectionHitError = std::numeric_limits<double>::quiet_NaN();
     };
@@ -86,6 +105,13 @@ namespace {
         double p95 = 0.0;
         double minimum = 0.0;
         double maximum = 0.0;
+    };
+
+    struct ImageMetrics {
+        double rmse = 0.0;
+        double relativeRmse = 0.0;
+        double psnr = 0.0;
+        double maximumAbsolute = 0.0;
     };
 
     glm::mat4 fittedModelTransform(
@@ -176,6 +202,14 @@ namespace {
         return true;
     }
 
+    glm::dvec3 perOriginSphereReference(
+        const glm::dvec3& origin,
+        const glm::dvec3& directionInput,
+        const double radius
+    ) {
+        return origin + glm::normalize(directionInput) * radius;
+    }
+
     bool saveTexturePfm(
         const std::filesystem::path& path,
         const unsigned int texture,
@@ -207,6 +241,82 @@ namespace {
         return stream.good();
     }
 
+    std::vector<float> readTextureRgba(const unsigned int texture, const int width, const int height) {
+        std::vector<float> rgba(static_cast<std::size_t>(width) * height * 4);
+        glGetTextureImage(
+            texture,
+            0,
+            GL_RGBA,
+            GL_FLOAT,
+            static_cast<GLsizei>(rgba.size() * sizeof(float)),
+            rgba.data()
+        );
+        return rgba;
+    }
+
+    ImageMetrics calculateImageMetricsRegion(
+        const std::vector<float>& image,
+        const std::vector<float>& reference,
+        const int width,
+        const int height,
+        const int x0,
+        const int y0,
+        const int x1,
+        const int y1
+    ) {
+        ImageMetrics result;
+        if (image.size() != reference.size() || image.empty() || width <= 0 || height <= 0) {
+            result.rmse = result.relativeRmse = result.psnr = result.maximumAbsolute = std::numeric_limits<double>::quiet_NaN();
+            return result;
+        }
+
+        const int minX = std::clamp(x0, 0, width);
+        const int minY = std::clamp(y0, 0, height);
+        const int maxX = std::clamp(x1, minX, width);
+        const int maxY = std::clamp(y1, minY, height);
+        long double squaredError = 0.0;
+        long double squaredReference = 0.0;
+        double peak = 1.0;
+        double maximumAbsolute = 0.0;
+        std::size_t channelCount = 0;
+        for (int y = minY; y < maxY; ++y) {
+            for (int x = minX; x < maxX; ++x) {
+                const std::size_t index = (static_cast<std::size_t>(y) * width + x) * 4;
+                for (int channel = 0; channel < 3; ++channel) {
+                    const double a = image[index + channel];
+                    const double b = reference[index + channel];
+                    const double difference = a - b;
+                    squaredError += difference * difference;
+                    squaredReference += b * b;
+                    peak = std::max(peak, std::abs(b));
+                    maximumAbsolute = std::max(maximumAbsolute, std::abs(difference));
+                    ++channelCount;
+                }
+            }
+        }
+        if (channelCount == 0) {
+            result.rmse = result.relativeRmse = result.psnr = result.maximumAbsolute = std::numeric_limits<double>::quiet_NaN();
+            return result;
+        }
+
+        const double mse = static_cast<double>(squaredError / channelCount);
+        const double referenceMse = static_cast<double>(squaredReference / channelCount);
+        result.rmse = std::sqrt(mse);
+        result.relativeRmse = result.rmse / std::max(std::sqrt(referenceMse), 1e-12);
+        result.psnr = mse <= 0.0 ? std::numeric_limits<double>::infinity() : 10.0 * std::log10((peak * peak) / mse);
+        result.maximumAbsolute = maximumAbsolute;
+        return result;
+    }
+
+    ImageMetrics calculateImageMetrics(
+        const std::vector<float>& image,
+        const std::vector<float>& reference,
+        const int width,
+        const int height
+    ) {
+        return calculateImageMetricsRegion(image, reference, width, height, 0, 0, width, height);
+    }
+
     class SkyResearch final : public gfx::research::Application {
     public:
         explicit SkyResearch(LaunchOptions launchOptions) :
@@ -234,7 +344,8 @@ namespace {
 
             const gfx::research::ColorAttachmentDesc sceneAttachments[] = {
                 {GL_RGBA16F, GL_LINEAR, GL_LINEAR},
-                {GL_RGBA16F, GL_NEAREST, GL_NEAREST}
+                {GL_RGBA16F, GL_NEAREST, GL_NEAREST},
+                {GL_RGBA32F, GL_NEAREST, GL_NEAREST}
             };
             if (!sceneTarget_.create(config().width, config().height, sceneAttachments, true, GL_DEPTH_COMPONENT32F)) return false;
 
@@ -244,6 +355,8 @@ namespace {
                 {GL_RGBA16F, GL_NEAREST, GL_NEAREST}
             };
             if (!postTarget_.create(config().width, config().height, postAttachments, false)) return false;
+            renderWidth_ = config().width;
+            renderHeight_ = config().height;
 
             reflectiveSphere_ = gfx::research::make_uv_sphere(1.0f, 96, 48);
             plane_ = gfx::research::make_plane(24.0f, 16);
@@ -267,41 +380,17 @@ namespace {
         }
 
         void on_resize(const int width, const int height) override {
+            if (publicationRunning_) return;
+            renderWidth_ = width;
+            renderHeight_ = height;
             sceneTarget_.resize(width, height);
             postTarget_.resize(width, height);
         }
 
         void loadResearchModels() {
-            const std::filesystem::path models = root_ / "assets/models";
-            const std::filesystem::path legacyAssets = root_ / "assets";
-
-            dragonLoaded_ = loadFirstPresent(dragon_, {
-                models / "dragon.obj",
-                models / "stanford_dragon.obj",
-                legacyAssets / "dragon.obj",
-                legacyAssets / "stanford_dragon.obj"
-            });
-            suzanneLoaded_ = loadFirstPresent(suzanne_, {
-                models / "suzanne.obj",
-                legacyAssets / "suzanne.obj"
-            });
-            teapotLoaded_ = loadFirstPresent(teapot_, {
-                models / "teapot.obj",
-                models / "utah_teapot.obj",
-                legacyAssets / "teapot.obj",
-                legacyAssets / "utah_teapot.obj"
-            });
-        }
-
-        static bool loadFirstPresent(
-            gfx::research::Model& model,
-            const std::initializer_list<std::filesystem::path> paths
-        ) {
-            model.clear();
-            for (const std::filesystem::path& path : paths) {
-                if (std::filesystem::exists(path) && model.load(path)) return true;
-            }
-            return false;
+            dragonLoaded_ = dragon_.load(gfx::research::model_path(gfx::research::ModelAsset::Dragon));
+            suzanneLoaded_ = suzanne_.load(gfx::research::model_path(gfx::research::ModelAsset::Suzanne));
+            teapotLoaded_ = teapot_.load(gfx::research::model_path(gfx::research::ModelAsset::Teapot));
         }
 
         void drawMesh(
@@ -389,21 +478,25 @@ namespace {
 
         void on_frame(const gfx::research::FrameInfo& frame) override {
             preparePublicationFrame(frame);
+            const int renderWidth = publicationRunning_ ? renderWidth_ : frame.width;
+            const int renderHeight = publicationRunning_ ? renderHeight_ : frame.height;
 
             sceneTarget_.bind();
-            glViewport(0, 0, frame.width, frame.height);
+            glViewport(0, 0, renderWidth, renderHeight);
             const float clearColor[] = {0.0f, 0.0f, 0.0f, 0.0f};
             const float clearNormal[] = {0.5f, 0.5f, 1.0f, 1.0f};
+            const float clearWorld[] = {0.0f, 0.0f, 0.0f, 0.0f};
             glClearBufferfv(GL_COLOR, 0, clearColor);
             glClearBufferfv(GL_COLOR, 1, clearNormal);
+            glClearBufferfv(GL_COLOR, 2, clearWorld);
             glClear(GL_DEPTH_BUFFER_BIT);
 
-            const float aspect = static_cast<float>(frame.width) / static_cast<float>(frame.height);
+            const float aspect = static_cast<float>(renderWidth) / static_cast<float>(renderHeight);
             const glm::mat4 viewProjection = camera_.view_projection(aspect);
             drawScene(viewProjection);
 
             postTarget_.bind();
-            glViewport(0, 0, frame.width, frame.height);
+            glViewport(0, 0, renderWidth, renderHeight);
             glDisable(GL_DEPTH_TEST);
             const float clearPost[] = {0.0f, 0.0f, 0.0f, 1.0f};
             const float clearHit[] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -416,9 +509,11 @@ namespace {
             glBindTextureUnit(0, sceneTarget_.color(0));
             glBindTextureUnit(1, sceneTarget_.color(1));
             glBindTextureUnit(2, sceneTarget_.depth());
+            glBindTextureUnit(3, sceneTarget_.color(2));
             skyShader_.set_int("uSceneColor", 0);
             skyShader_.set_int("uNormalRoughness", 1);
             skyShader_.set_int("uDepth", 2);
+            skyShader_.set_int("uWorldPosition", 3);
             skyShader_.set_mat4("uInvViewProjection", inverseViewProjection);
             skyShader_.set_vec3("uEye", camera_.position());
             skyShader_.set_vec3("uSkyCenter", skyCenter_);
@@ -432,7 +527,8 @@ namespace {
             skyShader_.set_float("uLocalInfluence", nullTest_ ? 0.0f : localInfluence_);
             skyShader_.set_float("uTime", animateSky_ ? static_cast<float>(frame.time_seconds) : frozenTime_);
             skyShader_.set_int("uSkyMode", skyMode_);
-            skyShader_.set_int("uMethod", proposed_ ? 1 : 0);
+            skyShader_.set_int("uMethod", method_);
+            skyShader_.set_int("uObjectReflections", objectReflections_ ? 1 : 0);
 
             gpuTimer_.begin();
             fullscreen_.draw();
@@ -445,8 +541,8 @@ namespace {
                 0,
                 0,
                 0,
-                frame.width,
-                frame.height,
+                renderWidth,
+                renderHeight,
                 0,
                 0,
                 frame.width,
@@ -457,7 +553,7 @@ namespace {
             glEnable(GL_DEPTH_TEST);
 
             recordManualTiming(frame);
-            processPublicationFrame(frame, viewProjection);
+            processPublicationFrame(frame, viewProjection, renderWidth, renderHeight);
         }
 
         void recordManualTiming(const gfx::research::FrameInfo& frame) {
@@ -467,12 +563,12 @@ namespace {
                 csv_.row(
                     "frame", "method", "sky_mode", "gpu_ms", "width", "height",
                     "sky_radius", "cloud_coverage", "cloud_scale", "cloud_density",
-                    "star_intensity", "aurora_intensity", "local_influence", "null_test"
+                    "star_intensity", "aurora_intensity", "local_influence", "null_test", "object_reflections"
                 );
             }
             csv_.row(
                 frame.frame_index,
-                proposed_ ? "local-ray" : "direction-only",
+                methodId(method_),
                 SKY_MODE_IDS[static_cast<std::size_t>(skyMode_)],
                 gpuTimer_.milliseconds(),
                 frame.width,
@@ -484,7 +580,8 @@ namespace {
                 starIntensity_,
                 auroraIntensity_,
                 nullTest_ ? 0.0f : localInfluence_,
-                nullTest_ ? 1 : 0
+                nullTest_ ? 1 : 0,
+                objectReflections_ ? 1 : 0
             );
         }
 
@@ -509,7 +606,8 @@ namespace {
             }
 
             ImGui::SeparatorText("Method");
-            ImGui::Checkbox("Proposed local-ray sky", &proposed_);
+            ImGui::Combo("Environment sampling", &method_, METHOD_LABELS.data(), static_cast<int>(METHOD_LABELS.size()));
+            ImGui::Checkbox("Object sky reflections", &objectReflections_);
             ImGui::Checkbox("Spatially invariant null test", &nullTest_);
             ImGui::Checkbox("Record CSV", &record_);
             ImGui::SliderFloat("Local influence", &localInfluence_, 0.0f, 1.5f, "%.2f");
@@ -519,13 +617,14 @@ namespace {
             ImGui::SeparatorText("Procedural sky");
             ImGui::Combo("Sky mode", &skyMode_, SKY_MODE_LABELS.data(), static_cast<int>(SKY_MODE_LABELS.size()));
             ImGui::SliderAngle("Sun / moon elevation", &sunElevation_, 5.0f, 85.0f);
-            if (skyMode_ != 2) {
+            if (skyMode_ == 0 || skyMode_ == 1) {
                 ImGui::SliderFloat("Cloud coverage", &cloudCoverage_, 0.0f, 1.0f, "%.2f");
                 ImGui::SliderFloat("Cloud scale", &cloudScale_, 0.25f, 3.0f, "%.2f");
                 ImGui::SliderFloat("Cloud density", &cloudDensity_, 0.0f, 1.35f, "%.2f");
             }
-            if (skyMode_ != 0) ImGui::SliderFloat("Star intensity", &starIntensity_, 0.0f, 3.0f, "%.2f");
+            if (skyMode_ == 1 || skyMode_ == 2) ImGui::SliderFloat("Star intensity", &starIntensity_, 0.0f, 3.0f, "%.2f");
             if (skyMode_ == 2) ImGui::SliderFloat("Aurora intensity", &auroraIntensity_, 0.0f, 3.0f, "%.2f");
+            if (skyMode_ == 3) ImGui::TextDisabled("Synthetic deterministic world-space test field");
             ImGui::Checkbox("Animate sky", &animateSky_);
             if (!animateSky_) ImGui::SliderFloat("Frozen time", &frozenTime_, 0.0f, 120.0f, "%.1f");
 
@@ -545,7 +644,7 @@ namespace {
             assetStatus(teapotLoaded_);
             if (ImGui::Button("Reload models")) loadResearchModels();
             if (!dragonLoaded_ || !suzanneLoaded_ || !teapotLoaded_) {
-                ImGui::TextWrapped("Missing classic assets. Run the CMake target fetch-assets or: python tools/fetch_assets.py");
+                ImGui::TextWrapped("Bundled research models from gfx-research-base could not be loaded.");
             }
 
             ImGui::SeparatorText("Camera");
@@ -571,8 +670,8 @@ namespace {
 
         void saveScreenshot(const gfx::research::FrameInfo& frame) const {
             const std::string filename = std::string("results/sky-")
-                + SKY_MODE_IDS[static_cast<std::size_t>(skyMode_)]
-                + (proposed_ ? "-local-ray.png" : "-direction-only.png");
+                + SKY_MODE_IDS[static_cast<std::size_t>(skyMode_)] + '-' + methodId(method_)
+                + (objectReflections_ ? "-reflections-on.png" : "-reflections-off.png");
             gfx::research::save_framebuffer_png(filename, frame.width, frame.height);
         }
 
@@ -582,7 +681,6 @@ namespace {
             publicationCaseIndex_ = 0;
             publicationCaseApplied_ = false;
             publicationRunning_ = !publicationCases_.empty();
-            publicationFull_ = full;
             publicationOutput_ = launchOptions_.publicationOutput;
             std::filesystem::create_directories(publicationOutput_ / "images");
             std::filesystem::create_directories(publicationOutput_ / "hdr");
@@ -590,11 +688,15 @@ namespace {
             publicationRaw_.open(publicationOutput_ / "raw.csv", std::ios::out | std::ios::trunc);
             publicationSummary_.open(publicationOutput_ / "summary.csv", std::ios::out | std::ios::trunc);
             publicationCaptures_.open(publicationOutput_ / "captures.csv", std::ios::out | std::ios::trunc);
+            publicationQuality_.open(publicationOutput_ / "quality.csv", std::ios::out | std::ios::trunc);
+            publicationNull_.open(publicationOutput_ / "null.csv", std::ios::out | std::ios::trunc);
             publicationManifest_.open(publicationOutput_ / "manifest.txt", std::ios::out | std::ios::trunc);
 
-            publicationRaw_ << "case_id,pair_id,sweep,step,method,sky_mode,sample,gpu_ms,width,height,target_width,target_height,sky_radius,camera_offset_x,sphere_x,null_test\n";
-            publicationSummary_ << "case_id,pair_id,sweep,step,method,sky_mode,samples,mean_ms,median_ms,stddev_ms,p95_ms,min_ms,max_ms,width,height,target_width,target_height,resolution_matched,sky_radius,camera_offset_x,sphere_x,null_test,background_hit_error,reflection_hit_error\n";
-            publicationCaptures_ << "case_id,pair_id,sweep,step,method,sky_mode,png,pfm\n";
+            publicationRaw_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,sample,gpu_ms,width,height,target_width,target_height,sky_radius,camera_offset_x,sphere_x,null_test,reflections_enabled\n";
+            publicationSummary_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,samples,mean_ms,median_ms,stddev_ms,p95_ms,min_ms,max_ms,width,height,target_width,target_height,resolution_matched,sky_radius,camera_offset_x,sphere_x,null_test,reflections_enabled,world_position_rmse,background_hit_error,reflection_hit_error\n";
+            publicationCaptures_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,width,height,reflections_enabled,png,pfm\n";
+            publicationQuality_ << "pair_id,group_id,sweep,step,sky_mode,width,height,sky_radius,camera_offset_x,sphere_x,reflections_enabled,metric_region,baseline_rmse,proposed_rmse,baseline_relative_rmse,proposed_relative_rmse,baseline_psnr_db,proposed_psnr_db,baseline_max_abs,proposed_max_abs\n";
+            publicationNull_ << "pair_id,sky_mode,width,height,reflections_enabled,linear_byte_identical,display_byte_identical,linear_rmse,linear_max_abs,display_rmse,display_max_abs\n";
             publicationManifest_
                 << "gfx-research-sky publication suite\n"
                 << "profile=" << (full ? "full" : "quick") << '\n'
@@ -605,6 +707,12 @@ namespace {
                 << "star_intensity=" << starIntensity_ << '\n'
                 << "aurora_intensity=" << auroraIntensity_ << '\n'
                 << "local_influence=" << localInfluence_ << '\n'
+                << "timing_repeats=" << (full ? 10 : 2) << '\n'
+                << "offscreen_exact_resolution=1\n"
+                << "explicit_position_reference=1\n"
+                << "proposed_method=per-origin-virtual-sphere\n"
+                << "legacy_fixed_domain_available=1\n"
+                << "reflection_toggle_timing=1\n"
                 << "dragon_loaded=" << dragonLoaded_ << '\n'
                 << "suzanne_loaded=" << suzanneLoaded_ << '\n'
                 << "teapot_loaded=" << teapotLoaded_ << '\n';
@@ -617,22 +725,42 @@ namespace {
             if (publicationRaw_.is_open()) publicationRaw_.close();
             if (publicationSummary_.is_open()) publicationSummary_.close();
             if (publicationCaptures_.is_open()) publicationCaptures_.close();
+            if (publicationQuality_.is_open()) publicationQuality_.close();
+            if (publicationNull_.is_open()) publicationNull_.close();
             if (publicationManifest_.is_open()) {
                 publicationManifest_ << "completed=" << (completed ? 1 : 0) << '\n';
                 publicationManifest_.close();
             }
             publicationRunning_ = false;
             publicationCaseApplied_ = false;
+            method_ = METHOD_PER_ORIGIN_SPHERE;
+            objectReflections_ = true;
+            int framebufferWidth = 0;
+            int framebufferHeight = 0;
+            glfwGetFramebufferSize(window(), &framebufferWidth, &framebufferHeight);
+            if (framebufferWidth > 0 && framebufferHeight > 0) {
+                renderWidth_ = framebufferWidth;
+                renderHeight_ = framebufferHeight;
+                sceneTarget_.resize(renderWidth_, renderHeight_);
+                postTarget_.resize(renderWidth_, renderHeight_);
+            }
             publicationSamples_.clear();
+            publicationBaselineImage_.clear();
+            publicationLocalImage_.clear();
+            publicationQualityPairId_.clear();
+            publicationNullPairId_.clear();
+            publicationNullBaselineLinear_.clear();
+            publicationNullBaselineDisplay_.clear();
         }
 
         std::vector<PublicationCase> makePublicationCases(const bool full) const {
             std::vector<PublicationCase> cases;
-            const std::array<std::pair<int, int>, 2> fullResolutions = {{{1920, 1080}, {2560, 1440}}};
+            const std::array<std::pair<int, int>, 3> fullResolutions = {{{1920, 1080}, {2560, 1440}, {3840, 2160}}};
             const std::array<std::pair<int, int>, 1> quickResolutions = {{{1920, 1080}}};
 
             const int timingWarmup = full ? 120 : 30;
             const int timingSamples = full ? 600 : 120;
+            const int timingRepeats = full ? 10 : 2;
             const int sweepWarmup = full ? 16 : 8;
             const int sweepSamples = full ? 64 : 24;
             const int radiusWarmup = full ? 48 : 16;
@@ -640,35 +768,66 @@ namespace {
             const int nullWarmup = full ? 64 : 24;
             const int nullSamples = full ? 240 : 80;
 
-            const auto appendMethodPair = [&](PublicationCase base) {
-                for (const bool proposed : {false, true}) {
+            const auto appendMethodPair = [&](PublicationCase base, const bool reverse = false) {
+                if (base.groupId.empty()) base.groupId = base.pairId;
+                const std::array<int, 2> order = reverse
+                    ? std::array<int, 2>{METHOD_PER_ORIGIN_SPHERE, METHOD_DIRECTION_ONLY}
+                    : std::array<int, 2>{METHOD_DIRECTION_ONLY, METHOD_PER_ORIGIN_SPHERE};
+                for (const int method : order) {
                     PublicationCase test = base;
-                    test.proposed = proposed;
+                    test.method = method;
                     cases.push_back(std::move(test));
                 }
             };
 
-            const auto appendTimingForResolution = [&](const int width, const int height) {
-                for (int mode = 0; mode < 3; ++mode) {
-                    PublicationCase test;
-                    test.pairId = std::string("timing-") + SKY_MODE_IDS[mode] + '-' + std::to_string(width) + 'x' + std::to_string(height);
-                    test.sweep = "timing";
-                    test.skyMode = mode;
-                    test.targetWidth = width;
-                    test.targetHeight = height;
-                    test.warmupFrames = timingWarmup;
-                    test.sampleFrames = timingSamples;
-                    test.capture = true;
-                    appendMethodPair(test);
+            const auto appendQualityTriple = [&](PublicationCase base) {
+                if (base.groupId.empty()) base.groupId = base.pairId;
+                base.quality = true;
+                for (const int method : {
+                    METHOD_DIRECTION_ONLY,
+                    METHOD_PER_ORIGIN_SPHERE,
+                    METHOD_EXPLICIT_POSITION_REFERENCE
+                }) {
+                    PublicationCase test = base;
+                    test.method = method;
+                    cases.push_back(std::move(test));
                 }
             };
 
-            if (full) {
-                for (const auto [width, height] : fullResolutions) appendTimingForResolution(width, height);
-            } else {
-                for (const auto [width, height] : quickResolutions) appendTimingForResolution(width, height);
-            }
+            const auto appendTimingForResolution = [&](const int width, const int height, const bool reflectionsEnabled) {
+                for (int mode = 0; mode < 3; ++mode) {
+                    const std::string reflectionId = reflectionsEnabled ? "reflections-on" : "reflections-off";
+                    const std::string group = std::string("timing-") + SKY_MODE_IDS[mode] + '-' + reflectionId + '-'
+                        + std::to_string(width) + 'x' + std::to_string(height);
+                    for (int repeat = 0; repeat < timingRepeats; ++repeat) {
+                        PublicationCase test;
+                        test.groupId = group;
+                        test.pairId = group + "-run-" + std::to_string(repeat);
+                        test.sweep = "timing";
+                        test.repeat = repeat;
+                        test.skyMode = mode;
+                        test.reflectionsEnabled = reflectionsEnabled;
+                        test.targetWidth = width;
+                        test.targetHeight = height;
+                        test.warmupFrames = timingWarmup;
+                        test.sampleFrames = timingSamples;
+                        test.capture = false;
+                        appendMethodPair(test, (repeat & 1) != 0);
+                    }
+                }
+            };
 
+            const auto appendTimingSet = [&](const auto& resolutions) {
+                for (const auto [width, height] : resolutions) {
+                    appendTimingForResolution(width, height, false);
+                    appendTimingForResolution(width, height, true);
+                }
+            };
+
+            if (full) appendTimingSet(fullResolutions);
+            else appendTimingSet(quickResolutions);
+
+            // Background position test: reflections are disabled so the result measures only the sky path.
             const int translationSteps = full ? 21 : 11;
             for (int mode = 0; mode < 3; ++mode) {
                 for (int step = 0; step < translationSteps; ++step) {
@@ -676,44 +835,51 @@ namespace {
                     const float offset = -1.5f + t * 3.0f;
                     PublicationCase test;
                     test.pairId = std::string("camera-") + SKY_MODE_IDS[mode] + "-x-" + scalarToken(offset);
+                    test.groupId = test.pairId;
                     test.sweep = "camera_translation";
                     test.step = step;
                     test.skyMode = mode;
+                    test.reflectionsEnabled = false;
                     test.cameraOffsetX = offset;
                     test.warmupFrames = sweepWarmup;
                     test.sampleFrames = sweepSamples;
-                    test.capture = step == 0 || step == translationSteps / 2 || step == translationSteps - 1;
+                    test.capture = mode == 0 && (step == 0 || step == translationSteps / 2 || step == translationSteps - 1);
                     appendMethodPair(test);
                 }
             }
 
+            // Reflection position test: object reflections are enabled by definition.
             for (int mode = 0; mode < 3; ++mode) {
                 for (int step = 0; step < translationSteps; ++step) {
                     const float t = translationSteps == 1 ? 0.0f : static_cast<float>(step) / static_cast<float>(translationSteps - 1);
                     const float offset = -1.5f + t * 3.0f;
                     PublicationCase test;
                     test.pairId = std::string("object-") + SKY_MODE_IDS[mode] + "-x-" + scalarToken(offset);
+                    test.groupId = test.pairId;
                     test.sweep = "object_translation";
                     test.step = step;
                     test.skyMode = mode;
+                    test.reflectionsEnabled = true;
                     test.sphereX = offset;
                     test.warmupFrames = sweepWarmup;
                     test.sampleFrames = sweepSamples;
-                    test.capture = step == 0 || step == translationSteps / 2 || step == translationSteps - 1;
+                    test.capture = false;
                     appendMethodPair(test);
                 }
             }
 
             const std::vector<float> radii = full
-                ? std::vector<float>{75.0f, 150.0f, 300.0f, 600.0f, 1200.0f}
-                : std::vector<float>{100.0f, 300.0f, 900.0f};
+                ? std::vector<float>{15.0f, 30.0f, 75.0f, 150.0f, 300.0f}
+                : std::vector<float>{15.0f, 30.0f, 150.0f};
             for (int mode = 0; mode < 3; ++mode) {
                 for (std::size_t step = 0; step < radii.size(); ++step) {
                     PublicationCase test;
                     test.pairId = std::string("radius-") + SKY_MODE_IDS[mode] + '-' + scalarToken(radii[step]);
+                    test.groupId = test.pairId;
                     test.sweep = "radius";
                     test.step = static_cast<int>(step);
                     test.skyMode = mode;
+                    test.reflectionsEnabled = true;
                     test.skyRadius = radii[step];
                     test.warmupFrames = radiusWarmup;
                     test.sampleFrames = radiusSamples;
@@ -725,14 +891,16 @@ namespace {
                 for (int mode = 0; mode < 3; ++mode) {
                     PublicationCase test;
                     test.pairId = std::string("null-") + SKY_MODE_IDS[mode] + '-' + std::to_string(width) + 'x' + std::to_string(height);
+                    test.groupId = test.pairId;
                     test.sweep = "null";
                     test.skyMode = mode;
+                    test.reflectionsEnabled = true;
                     test.nullTest = true;
                     test.targetWidth = width;
                     test.targetHeight = height;
                     test.warmupFrames = nullWarmup;
                     test.sampleFrames = nullSamples;
-                    test.capture = true;
+                    test.capture = false;
                     appendMethodPair(test);
                 }
             };
@@ -742,16 +910,102 @@ namespace {
             } else {
                 for (const auto [width, height] : quickResolutions) appendNullAtResolution(width, height);
             }
+
+            // Full-frame image-space ablation keeps reflections enabled so the explicit-position variant
+            // still exercises geometry reconstruction. Background pixels are identical between the
+            // proposed and explicit-position variants by construction; geometry isolates reconstruction error.
+            const int qualitySteps = full ? 7 : 3;
+            for (int mode = 0; mode < 3; ++mode) {
+                for (int step = 0; step < qualitySteps; ++step) {
+                    const float t = qualitySteps == 1 ? 0.0f : static_cast<float>(step) / static_cast<float>(qualitySteps - 1);
+                    const float offset = -6.0f + t * 12.0f;
+                    PublicationCase test;
+                    test.pairId = std::string("quality-") + SKY_MODE_IDS[mode] + "-x-" + scalarToken(offset);
+                    test.groupId = test.pairId;
+                    test.sweep = "image_quality";
+                    test.step = step;
+                    test.skyMode = mode;
+                    test.reflectionsEnabled = true;
+                    test.cameraOffsetX = offset;
+                    test.skyRadius = 30.0f;
+                    test.targetWidth = 1920;
+                    test.targetHeight = 1080;
+                    test.warmupFrames = sweepWarmup;
+                    test.sampleFrames = sweepSamples;
+                    test.capture = mode == 0
+                        ? (step == 0 || step == qualitySteps / 2 || step == qualitySteps - 1)
+                        : (step == qualitySteps / 2);
+                    appendQualityTriple(test);
+                }
+            }
+
+            const int reflectionQualitySteps = full ? 5 : 3;
+            for (int mode = 0; mode < 3; ++mode) {
+                for (int step = 0; step < reflectionQualitySteps; ++step) {
+                    const float t = reflectionQualitySteps == 1 ? 0.0f : static_cast<float>(step) / static_cast<float>(reflectionQualitySteps - 1);
+                    const float offset = -1.5f + t * 3.0f;
+                    PublicationCase test;
+                    test.pairId = std::string("reflection-quality-") + SKY_MODE_IDS[mode] + "-x-" + scalarToken(offset);
+                    test.groupId = test.pairId;
+                    test.sweep = "reflection_image_quality";
+                    test.step = step;
+                    test.skyMode = mode;
+                    test.reflectionsEnabled = true;
+                    test.sphereX = offset;
+                    test.skyRadius = 30.0f;
+                    test.targetWidth = 1920;
+                    test.targetHeight = 1080;
+                    test.warmupFrames = sweepWarmup;
+                    test.sampleFrames = sweepSamples;
+                    test.capture = mode == 0
+                        ? (step == 0 || step == reflectionQualitySteps / 2 || step == reflectionQualitySteps - 1)
+                        : (step == reflectionQualitySteps / 2);
+                    appendQualityTriple(test);
+                }
+            }
+
+            // Controlled world-space signal. This synthetic field is intentionally simple and strongly
+            // position-dependent so camera/object translation cannot be hidden by a visually smooth sky.
+            const int syntheticSteps = full ? 13 : 5;
+            for (int step = 0; step < syntheticSteps; ++step) {
+                const float t = syntheticSteps == 1 ? 0.0f : static_cast<float>(step) / static_cast<float>(syntheticSteps - 1);
+                const float offset = -3.0f + t * 6.0f;
+                PublicationCase background;
+                background.pairId = std::string("synthetic-camera-x-") + scalarToken(offset);
+                background.groupId = background.pairId;
+                background.sweep = "synthetic_camera_translation";
+                background.step = step;
+                background.skyMode = 3;
+                background.reflectionsEnabled = false;
+                background.cameraOffsetX = offset;
+                background.skyRadius = 30.0f;
+                background.warmupFrames = sweepWarmup;
+                background.sampleFrames = sweepSamples;
+                background.capture = step == 0 || step == syntheticSteps / 2 || step == syntheticSteps - 1;
+                appendMethodPair(background);
+
+                PublicationCase reflection = background;
+                reflection.pairId = std::string("synthetic-object-x-") + scalarToken(offset);
+                reflection.groupId = reflection.pairId;
+                reflection.sweep = "synthetic_object_translation";
+                reflection.reflectionsEnabled = true;
+                reflection.cameraOffsetX = 0.0f;
+                reflection.sphereX = offset * 0.5f;
+                reflection.capture = false;
+                appendMethodPair(reflection);
+            }
+
             return cases;
         }
 
-        void preparePublicationFrame(const gfx::research::FrameInfo& frame) {
+        void preparePublicationFrame(const gfx::research::FrameInfo&) {
             if (!publicationRunning_ || publicationCaseIndex_ >= publicationCases_.size()) return;
             if (publicationCaseApplied_) return;
 
             const PublicationCase& test = publicationCases_[publicationCaseIndex_];
             skyMode_ = test.skyMode;
-            proposed_ = test.proposed;
+            method_ = test.method;
+            objectReflections_ = test.reflectionsEnabled;
             nullTest_ = test.nullTest;
             skyRadius_ = test.skyRadius;
             reflectiveSphereX_ = test.sphereX;
@@ -762,41 +1016,25 @@ namespace {
             publicationValidation_ = {};
             publicationWarmupRemaining_ = test.warmupFrames;
             publicationSampleIndex_ = 0;
-            publicationResizeWait_ = 0;
-            publicationResolutionMatched_ = false;
-            requestFramebufferSize(test.targetWidth, test.targetHeight, frame.width, frame.height);
+            renderWidth_ = test.targetWidth;
+            renderHeight_ = test.targetHeight;
+            sceneTarget_.resize(renderWidth_, renderHeight_);
+            postTarget_.resize(renderWidth_, renderHeight_);
+            publicationResolutionMatched_ = true;
             publicationCaseApplied_ = true;
         }
 
-        void requestFramebufferSize(const int targetWidth, const int targetHeight, const int framebufferWidth, const int framebufferHeight) const {
-            int windowWidth = 1;
-            int windowHeight = 1;
-            glfwGetWindowSize(window(), &windowWidth, &windowHeight);
-            const double scaleX = windowWidth > 0 ? static_cast<double>(framebufferWidth) / windowWidth : 1.0;
-            const double scaleY = windowHeight > 0 ? static_cast<double>(framebufferHeight) / windowHeight : 1.0;
-            const int requestedWidth = std::max(1, static_cast<int>(std::lround(targetWidth / std::max(scaleX, 0.01))));
-            const int requestedHeight = std::max(1, static_cast<int>(std::lround(targetHeight / std::max(scaleY, 0.01))));
-            glfwSetWindowSize(window(), requestedWidth, requestedHeight);
+
+        bool publicationResolutionReady(const gfx::research::FrameInfo&, const PublicationCase&) {
+            return publicationResolutionMatched_;
         }
 
-        bool publicationResolutionReady(const gfx::research::FrameInfo& frame, const PublicationCase& test) {
-            const bool exact = frame.width == test.targetWidth && frame.height == test.targetHeight;
-            if (exact) {
-                publicationResolutionMatched_ = true;
-                return true;
-            }
-            ++publicationResizeWait_;
-            if (publicationResizeWait_ < 180) return false;
-
-            if (publicationResizeWait_ == 180) {
-                std::cerr << "Publication suite: requested " << test.targetWidth << 'x' << test.targetHeight
-                          << " but framebuffer is " << frame.width << 'x' << frame.height
-                          << ". Continuing and recording actual resolution.\n";
-            }
-            return true;
-        }
-
-        void processPublicationFrame(const gfx::research::FrameInfo& frame, const glm::mat4& viewProjection) {
+        void processPublicationFrame(
+            const gfx::research::FrameInfo& frame,
+            const glm::mat4& viewProjection,
+            const int renderWidth,
+            const int renderHeight
+        ) {
             if (!publicationRunning_ || !publicationCaseApplied_ || publicationCaseIndex_ >= publicationCases_.size()) return;
             const PublicationCase& test = publicationCases_[publicationCaseIndex_];
             if (!publicationResolutionReady(frame, test)) return;
@@ -807,22 +1045,23 @@ namespace {
             }
             if (!gpuTimer_.has_result()) return;
 
-            if (publicationSampleIndex_ == 0) publicationValidation_ = validateCurrentFrame(frame, viewProjection);
+            if (publicationSampleIndex_ == 0) publicationValidation_ = validateCurrentFrame(renderWidth, renderHeight, viewProjection);
 
             const double gpuMs = gpuTimer_.milliseconds();
             publicationSamples_.push_back(gpuMs);
             publicationRaw_
-                << caseId(test) << ',' << test.pairId << ',' << test.sweep << ',' << test.step << ','
-                << methodId(test.proposed) << ',' << SKY_MODE_IDS[static_cast<std::size_t>(test.skyMode)] << ','
+                << caseId(test) << ',' << test.pairId << ',' << test.groupId << ',' << test.sweep << ',' << test.step << ',' << test.repeat << ','
+                << methodId(test) << ',' << SKY_MODE_IDS[static_cast<std::size_t>(test.skyMode)] << ','
                 << publicationSampleIndex_ << ',' << std::setprecision(12) << gpuMs << ','
-                << frame.width << ',' << frame.height << ',' << test.targetWidth << ',' << test.targetHeight << ','
-                << test.skyRadius << ',' << test.cameraOffsetX << ',' << test.sphereX << ',' << (test.nullTest ? 1 : 0) << '\n';
+                << renderWidth << ',' << renderHeight << ',' << test.targetWidth << ',' << test.targetHeight << ','
+                << test.skyRadius << ',' << test.cameraOffsetX << ',' << test.sphereX << ',' << (test.nullTest ? 1 : 0) << ','
+                << (test.reflectionsEnabled ? 1 : 0) << '\n';
             ++publicationSampleIndex_;
 
             if (publicationSampleIndex_ < test.sampleFrames) return;
 
-            if (test.capture) capturePublicationCase(test, frame);
-            finishPublicationCase(test, frame);
+            if (test.capture) capturePublicationCase(test, renderWidth, renderHeight);
+            finishPublicationCase(test, renderWidth, renderHeight);
             ++publicationCaseIndex_;
             publicationCaseApplied_ = false;
 
@@ -834,46 +1073,157 @@ namespace {
             }
         }
 
-        void finishPublicationCase(const PublicationCase& test, const gfx::research::FrameInfo& frame) {
+        void finishPublicationCase(const PublicationCase& test, const int renderWidth, const int renderHeight) {
             const TimingStats stats = calculateStats(publicationSamples_);
             publicationSummary_
-                << caseId(test) << ',' << test.pairId << ',' << test.sweep << ',' << test.step << ','
-                << methodId(test.proposed) << ',' << SKY_MODE_IDS[static_cast<std::size_t>(test.skyMode)] << ','
+                << caseId(test) << ',' << test.pairId << ',' << test.groupId << ',' << test.sweep << ',' << test.step << ',' << test.repeat << ','
+                << methodId(test) << ',' << SKY_MODE_IDS[static_cast<std::size_t>(test.skyMode)] << ','
                 << publicationSamples_.size() << ','
                 << std::setprecision(12) << stats.mean << ',' << stats.median << ',' << stats.stddev << ','
                 << stats.p95 << ',' << stats.minimum << ',' << stats.maximum << ','
-                << frame.width << ',' << frame.height << ',' << test.targetWidth << ',' << test.targetHeight << ','
+                << renderWidth << ',' << renderHeight << ',' << test.targetWidth << ',' << test.targetHeight << ','
                 << (publicationResolutionMatched_ ? 1 : 0) << ',' << test.skyRadius << ','
                 << test.cameraOffsetX << ',' << test.sphereX << ',' << (test.nullTest ? 1 : 0) << ','
-                << publicationValidation_.backgroundHitError << ',' << publicationValidation_.reflectionHitError << '\n';
+                << (test.reflectionsEnabled ? 1 : 0) << ','
+                << publicationValidation_.worldPositionRmse << ',' << publicationValidation_.backgroundHitError << ','
+                << publicationValidation_.reflectionHitError << '\n';
+
+            if (test.quality) processQualityImage(test, renderWidth, renderHeight);
+            if (test.nullTest) processNullImage(test, renderWidth, renderHeight);
             publicationRaw_.flush();
             publicationSummary_.flush();
         }
 
-        void capturePublicationCase(const PublicationCase& test, const gfx::research::FrameInfo& frame) {
+        void capturePublicationCase(const PublicationCase& test, const int renderWidth, const int renderHeight) {
             const std::string id = caseId(test);
-            const std::filesystem::path pngRelative = std::filesystem::path("images") / (id + ".png");
             const std::filesystem::path pfmRelative = std::filesystem::path("hdr") / (id + ".pfm");
-            const std::filesystem::path png = publicationOutput_ / pngRelative;
             const std::filesystem::path pfm = publicationOutput_ / pfmRelative;
-            gfx::research::Framebuffer::bind_default();
-            const bool pngSaved = gfx::research::save_framebuffer_png(png, frame.width, frame.height);
-            const bool pfmSaved = saveTexturePfm(pfm, postTarget_.color(2), frame.width, frame.height);
+            const bool pfmSaved = saveTexturePfm(pfm, postTarget_.color(2), renderWidth, renderHeight);
             publicationCaptures_
-                << id << ',' << test.pairId << ',' << test.sweep << ',' << test.step << ','
-                << methodId(test.proposed) << ',' << SKY_MODE_IDS[static_cast<std::size_t>(test.skyMode)] << ','
-                << (pngSaved ? pngRelative.generic_string() : "") << ',' << (pfmSaved ? pfmRelative.generic_string() : "") << '\n';
+                << id << ',' << test.pairId << ',' << test.groupId << ',' << test.sweep << ',' << test.step << ',' << test.repeat << ','
+                << methodId(test) << ',' << SKY_MODE_IDS[static_cast<std::size_t>(test.skyMode)] << ','
+                << renderWidth << ',' << renderHeight << ',' << (test.reflectionsEnabled ? 1 : 0) << ',' << "" << ','
+                << (pfmSaved ? pfmRelative.generic_string() : "") << '\n';
             publicationCaptures_.flush();
         }
 
-        ValidationResult validateCurrentFrame(const gfx::research::FrameInfo& frame, const glm::mat4& viewProjection) const {
+        void processQualityImage(const PublicationCase& test, const int width, const int height) {
+            const std::vector<float> image = readTextureRgba(postTarget_.color(2), width, height);
+            if (test.method == METHOD_DIRECTION_ONLY) {
+                publicationQualityPairId_ = test.pairId;
+                publicationBaselineImage_ = image;
+                publicationLocalImage_.clear();
+                return;
+            }
+            if (test.method == METHOD_PER_ORIGIN_SPHERE) {
+                if (publicationQualityPairId_ == test.pairId) publicationLocalImage_ = image;
+                return;
+            }
+            if (test.method != METHOD_EXPLICIT_POSITION_REFERENCE || publicationQualityPairId_ != test.pairId) return;
+            if (publicationBaselineImage_.empty() || publicationLocalImage_.empty()) return;
+
+            ImageMetrics baseline;
+            ImageMetrics local;
+            const bool reflectionRegion = test.sweep == "reflection_image_quality";
+            if (reflectionRegion) {
+                const float aspect = static_cast<float>(width) / static_cast<float>(height);
+                const glm::mat4 viewProjection = camera_.view_projection(aspect);
+                const glm::vec4 clip = viewProjection * glm::vec4(test.sphereX, 0.95f, 0.15f, 1.0f);
+                const glm::vec3 ndc = clip.w > 0.0f ? glm::vec3(clip) / clip.w : glm::vec3(0.0f);
+                const int centerX = std::clamp(static_cast<int>((ndc.x * 0.5f + 0.5f) * width), 0, width - 1);
+                const int centerY = std::clamp(static_cast<int>((ndc.y * 0.5f + 0.5f) * height), 0, height - 1);
+                const int halfExtent = std::max(32, height / 7);
+                baseline = calculateImageMetricsRegion(
+                    publicationBaselineImage_, image, width, height,
+                    centerX - halfExtent, centerY - halfExtent, centerX + halfExtent, centerY + halfExtent
+                );
+                local = calculateImageMetricsRegion(
+                    publicationLocalImage_, image, width, height,
+                    centerX - halfExtent, centerY - halfExtent, centerX + halfExtent, centerY + halfExtent
+                );
+            } else {
+                baseline = calculateImageMetrics(publicationBaselineImage_, image, width, height);
+                local = calculateImageMetrics(publicationLocalImage_, image, width, height);
+            }
+            publicationQuality_
+                << test.pairId << ',' << test.groupId << ',' << test.sweep << ',' << test.step << ','
+                << SKY_MODE_IDS[static_cast<std::size_t>(test.skyMode)] << ',' << width << ',' << height << ','
+                << test.skyRadius << ',' << test.cameraOffsetX << ',' << test.sphereX << ','
+                << (test.reflectionsEnabled ? 1 : 0) << ','
+                << (reflectionRegion ? "reflection-roi" : "full-frame") << ','
+                << std::setprecision(12) << baseline.rmse << ',' << local.rmse << ','
+                << baseline.relativeRmse << ',' << local.relativeRmse << ','
+                << baseline.psnr << ',' << local.psnr << ','
+                << baseline.maximumAbsolute << ',' << local.maximumAbsolute << '\n';
+            publicationQuality_.flush();
+            publicationBaselineImage_.clear();
+            publicationLocalImage_.clear();
+            publicationQualityPairId_.clear();
+        }
+
+        void processNullImage(const PublicationCase& test, const int width, const int height) {
+            const std::vector<float> linear = readTextureRgba(postTarget_.color(2), width, height);
+            const std::vector<float> display = readTextureRgba(postTarget_.color(0), width, height);
+            if (test.method == METHOD_DIRECTION_ONLY) {
+                publicationNullPairId_ = test.pairId;
+                publicationNullBaselineLinear_ = linear;
+                publicationNullBaselineDisplay_ = display;
+                return;
+            }
+            if (test.method != METHOD_PER_ORIGIN_SPHERE || publicationNullPairId_ != test.pairId) return;
+            const ImageMetrics linearMetrics = calculateImageMetrics(publicationNullBaselineLinear_, linear, width, height);
+            const ImageMetrics displayMetrics = calculateImageMetrics(publicationNullBaselineDisplay_, display, width, height);
+            const bool linearIdentical = publicationNullBaselineLinear_.size() == linear.size()
+                && std::memcmp(publicationNullBaselineLinear_.data(), linear.data(), linear.size() * sizeof(float)) == 0;
+            const bool displayIdentical = publicationNullBaselineDisplay_.size() == display.size()
+                && std::memcmp(publicationNullBaselineDisplay_.data(), display.data(), display.size() * sizeof(float)) == 0;
+            publicationNull_
+                << test.pairId << ',' << SKY_MODE_IDS[static_cast<std::size_t>(test.skyMode)] << ','
+                << width << ',' << height << ',' << (test.reflectionsEnabled ? 1 : 0) << ','
+                << (linearIdentical ? 1 : 0) << ',' << (displayIdentical ? 1 : 0) << ','
+                << std::setprecision(12) << linearMetrics.rmse << ',' << linearMetrics.maximumAbsolute << ','
+                << displayMetrics.rmse << ',' << displayMetrics.maximumAbsolute << '\n';
+            publicationNull_.flush();
+            publicationNullPairId_.clear();
+            publicationNullBaselineLinear_.clear();
+            publicationNullBaselineDisplay_.clear();
+        }
+
+        ValidationResult validateCurrentFrame(const int width, const int height, const glm::mat4& viewProjection) const {
             ValidationResult result;
-            result.backgroundHitError = validateBackgroundHit(frame, viewProjection);
-            result.reflectionHitError = validateReflectionHit(frame, viewProjection);
+            result.worldPositionRmse = validateWorldPositionReconstruction(width, height, viewProjection);
+            result.backgroundHitError = validateBackgroundHit(width, height, viewProjection);
+            result.reflectionHitError = validateReflectionHit(width, height, viewProjection);
             return result;
         }
 
-        double validateBackgroundHit(const gfx::research::FrameInfo& frame, const glm::mat4& viewProjection) const {
+        double validateWorldPositionReconstruction(const int width, const int height, const glm::mat4& viewProjection) const {
+            const glm::dmat4 inverseViewProjection = glm::inverse(glm::dmat4(viewProjection));
+            long double squaredError = 0.0;
+            std::size_t count = 0;
+            constexpr int GRID_X = 12;
+            constexpr int GRID_Y = 7;
+            for (int gy = 0; gy < GRID_Y; ++gy) {
+                for (int gx = 0; gx < GRID_X; ++gx) {
+                    const int x = std::clamp((gx * 2 + 1) * width / (GRID_X * 2), 0, width - 1);
+                    const int y = std::clamp((gy * 2 + 1) * height / (GRID_Y * 2), 0, height - 1);
+                    const float depth = readDepth(x, y);
+                    if (depth >= 0.99999f) continue;
+                    const glm::vec4 explicitWorld = readRgba(sceneTarget_.color(2), x, y);
+                    if (explicitWorld.w < 0.5f) continue;
+                    const glm::dvec3 reconstructed = reconstructWorldReference(
+                        x, y, depth, width, height, inverseViewProjection
+                    );
+                    const double error = glm::length(reconstructed - glm::dvec3(explicitWorld));
+                    squaredError += error * error;
+                    ++count;
+                }
+            }
+            if (count == 0) return std::numeric_limits<double>::quiet_NaN();
+            return std::sqrt(static_cast<double>(squaredError / count));
+        }
+
+        double validateBackgroundHit(const int width, const int height, const glm::mat4& viewProjection) const {
             constexpr std::array<glm::vec2, 6> candidates = {
                 glm::vec2(0.82f, 0.82f), glm::vec2(0.18f, 0.82f), glm::vec2(0.86f, 0.62f),
                 glm::vec2(0.14f, 0.62f), glm::vec2(0.72f, 0.92f), glm::vec2(0.28f, 0.92f)
@@ -883,8 +1233,8 @@ namespace {
             int y = 0;
             bool found = false;
             for (const glm::vec2& uv : candidates) {
-                x = std::clamp(static_cast<int>(uv.x * frame.width), 0, frame.width - 1);
-                y = std::clamp(static_cast<int>(uv.y * frame.height), 0, frame.height - 1);
+                x = std::clamp(static_cast<int>(uv.x * width), 0, width - 1);
+                y = std::clamp(static_cast<int>(uv.y * height), 0, height - 1);
                 if (readDepth(x, y) >= 0.99999f) {
                     found = true;
                     break;
@@ -896,41 +1246,36 @@ namespace {
             if (gpuHit.w < 0.5f) return std::numeric_limits<double>::quiet_NaN();
 
             const glm::dmat4 inverseViewProjection = glm::inverse(glm::dmat4(viewProjection));
-            const glm::dvec3 farPoint = reconstructWorldReference(x, y, 1.0, frame, inverseViewProjection);
+            const glm::dvec3 farPoint = reconstructWorldReference(x, y, 1.0, width, height, inverseViewProjection);
             const glm::dvec3 origin = glm::dvec3(camera_.position());
             const glm::dvec3 direction = glm::normalize(farPoint - origin);
-            glm::dvec3 expected;
-            if (!intersectSphereReference(origin, direction, glm::dvec3(skyCenter_), skyRadius_, expected)) {
-                return std::numeric_limits<double>::quiet_NaN();
-            }
+            const glm::dvec3 expected = perOriginSphereReference(origin, direction, skyRadius_);
             return glm::length(glm::dvec3(gpuHit) - expected);
         }
 
-        double validateReflectionHit(const gfx::research::FrameInfo& frame, const glm::mat4& viewProjection) const {
-            if (!showReflectiveSphere_) return std::numeric_limits<double>::quiet_NaN();
+        double validateReflectionHit(const int width, const int height, const glm::mat4& viewProjection) const {
+            if (!showReflectiveSphere_ || !objectReflections_) return std::numeric_limits<double>::quiet_NaN();
             const glm::vec4 clip = viewProjection * glm::vec4(reflectiveSphereX_, 0.95f, 0.15f, 1.0f);
             if (clip.w <= 0.0f) return std::numeric_limits<double>::quiet_NaN();
             const glm::vec3 ndc = glm::vec3(clip) / clip.w;
             if (std::abs(ndc.x) > 1.0f || std::abs(ndc.y) > 1.0f) return std::numeric_limits<double>::quiet_NaN();
 
-            const int x = std::clamp(static_cast<int>((ndc.x * 0.5f + 0.5f) * frame.width), 0, frame.width - 1);
-            const int y = std::clamp(static_cast<int>((ndc.y * 0.5f + 0.5f) * frame.height), 0, frame.height - 1);
+            const int x = std::clamp(static_cast<int>((ndc.x * 0.5f + 0.5f) * width), 0, width - 1);
+            const int y = std::clamp(static_cast<int>((ndc.y * 0.5f + 0.5f) * height), 0, height - 1);
             const float depth = readDepth(x, y);
             if (depth >= 0.99999f) return std::numeric_limits<double>::quiet_NaN();
 
             const glm::vec4 normalRoughness = readRgba(sceneTarget_.color(1), x, y);
             const glm::dvec3 normal = glm::normalize(glm::dvec3(normalRoughness) * 2.0 - glm::dvec3(1.0));
-            const glm::dmat4 inverseViewProjection = glm::inverse(glm::dmat4(viewProjection));
-            const glm::dvec3 world = reconstructWorldReference(x, y, depth, frame, inverseViewProjection);
+            const glm::vec4 explicitWorld = readRgba(sceneTarget_.color(2), x, y);
+            if (explicitWorld.w < 0.5f) return std::numeric_limits<double>::quiet_NaN();
+            const glm::dvec3 world = glm::dvec3(explicitWorld);
             const glm::dvec3 eye = glm::dvec3(camera_.position());
             const glm::dvec3 incident = glm::normalize(world - eye);
             const glm::dvec3 reflected = glm::reflect(incident, normal);
             const glm::dvec3 origin = world + normal * 0.002;
 
-            glm::dvec3 expected;
-            if (!intersectSphereReference(origin, reflected, glm::dvec3(skyCenter_), skyRadius_, expected)) {
-                return std::numeric_limits<double>::quiet_NaN();
-            }
+            const glm::dvec3 expected = perOriginSphereReference(origin, reflected, skyRadius_);
 
             const glm::vec4 gpuHit = readRgba(postTarget_.color(1), x, y);
             if (gpuHit.w < 0.5f) return std::numeric_limits<double>::quiet_NaN();
@@ -979,22 +1324,32 @@ namespace {
             const int x,
             const int y,
             const double depth,
-            const gfx::research::FrameInfo& frame,
+            const int width,
+            const int height,
             const glm::dmat4& inverseViewProjection
         ) {
-            const double u = (static_cast<double>(x) + 0.5) / static_cast<double>(frame.width);
-            const double v = (static_cast<double>(y) + 0.5) / static_cast<double>(frame.height);
+            const double u = (static_cast<double>(x) + 0.5) / static_cast<double>(width);
+            const double v = (static_cast<double>(y) + 0.5) / static_cast<double>(height);
             const glm::dvec4 clip(u * 2.0 - 1.0, v * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
             const glm::dvec4 world = inverseViewProjection * clip;
             return glm::dvec3(world) / world.w;
         }
 
-        static const char* methodId(const bool proposed) {
-            return proposed ? "local-ray" : "direction-only";
+        static const char* methodId(const int method) {
+            switch (method) {
+                case METHOD_FIXED_DOMAIN: return "fixed-domain-local-ray";
+                case METHOD_PER_ORIGIN_SPHERE: return "per-origin-sphere";
+                case METHOD_EXPLICIT_POSITION_REFERENCE: return "explicit-position-reference";
+                default: return "direction-only";
+            }
+        }
+
+        static const char* methodId(const PublicationCase& test) {
+            return methodId(test.method);
         }
 
         static std::string caseId(const PublicationCase& test) {
-            return test.pairId + '-' + methodId(test.proposed);
+            return test.pairId + '-' + methodId(test);
         }
 
         LaunchOptions launchOptions_;
@@ -1028,7 +1383,8 @@ namespace {
         float sphereRoughness_ = 0.05f;
         float floorRoughness_ = 0.38f;
         int skyMode_ = 0;
-        bool proposed_ = true;
+        int method_ = METHOD_PER_ORIGIN_SPHERE;
+        bool objectReflections_ = true;
         bool nullTest_ = false;
         bool record_ = false;
         bool animateSky_ = false;
@@ -1047,13 +1403,21 @@ namespace {
         std::ofstream publicationRaw_;
         std::ofstream publicationSummary_;
         std::ofstream publicationCaptures_;
+        std::ofstream publicationQuality_;
+        std::ofstream publicationNull_;
         std::ofstream publicationManifest_;
+        std::vector<float> publicationBaselineImage_;
+        std::vector<float> publicationLocalImage_;
+        std::string publicationQualityPairId_;
+        std::vector<float> publicationNullBaselineLinear_;
+        std::vector<float> publicationNullBaselineDisplay_;
+        std::string publicationNullPairId_;
         std::size_t publicationCaseIndex_ = 0;
         int publicationWarmupRemaining_ = 0;
         int publicationSampleIndex_ = 0;
-        int publicationResizeWait_ = 0;
+        int renderWidth_ = 0;
+        int renderHeight_ = 0;
         bool publicationRunning_ = false;
-        bool publicationFull_ = false;
         bool publicationCaseApplied_ = false;
         bool publicationResolutionMatched_ = false;
     };

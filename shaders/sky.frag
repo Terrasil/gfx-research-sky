@@ -8,6 +8,7 @@ layout(location = 2) out vec4 oLinearColor;
 uniform sampler2D uSceneColor;
 uniform sampler2D uNormalRoughness;
 uniform sampler2D uDepth;
+uniform sampler2D uWorldPosition;
 uniform mat4 uInvViewProjection;
 uniform vec3 uEye;
 uniform vec3 uSkyCenter;
@@ -22,6 +23,7 @@ uniform float uLocalInfluence;
 uniform float uTime;
 uniform int uSkyMode;
 uniform int uMethod;
+uniform int uObjectReflections;
 
 const float PI = 3.14159265358979323846;
 
@@ -80,20 +82,24 @@ vec3 moonDirection() {
     return normalize(vec3(-0.52 * cos(elevation), sin(elevation), -0.73 * cos(elevation)));
 }
 
-vec3 localDomainDirection(vec3 rayDir, vec3 samplePosition) {
-    vec3 local = samplePosition - uSkyCenter;
+vec3 queryPosition(vec3 rayDir, vec3 samplePosition) {
+    vec3 baselinePosition = uSkyCenter + normalize(rayDir) * uSkyRadius;
+    return mix(baselinePosition, samplePosition, clamp(uLocalInfluence, 0.0, 1.0));
+}
+
+vec3 queryDirection(vec3 rayDir, vec3 samplePosition) {
+    vec3 local = queryPosition(rayDir, samplePosition) - uSkyCenter;
     float lengthSquared = dot(local, local);
-    vec3 localDir = lengthSquared > 1e-8 ? local * inversesqrt(lengthSquared) : rayDir;
-    return normalize(rayDir + (localDir - rayDir) * uLocalInfluence);
+    return lengthSquared > 1e-8 ? local * inversesqrt(lengthSquared) : normalize(rayDir);
 }
 
 float cloudField(vec3 rayDir, vec3 samplePosition) {
     if (rayDir.y < -0.08) return 0.0;
 
-    vec3 domainDir = localDomainDirection(rayDir, samplePosition);
+    vec3 query = queryPosition(rayDir, samplePosition);
     float scale = max(uCloudScale, 0.05);
     vec3 wind = vec3(uTime * 0.018, uTime * 0.006, -uTime * 0.012);
-    vec3 p = domainDir * (4.7 * scale) + wind;
+    vec3 p = ((query - uSkyCenter) / max(uSkyRadius, 1e-4)) * (4.7 * scale) + wind;
 
     float broad = fbm(p);
     float erosion = fbm(p * 2.35 + vec3(23.4, -8.1, 41.7));
@@ -105,10 +111,11 @@ float cloudField(vec3 rayDir, vec3 samplePosition) {
 }
 
 float cloudEdge(vec3 rayDir, vec3 samplePosition) {
-    vec3 domainDir = localDomainDirection(rayDir, samplePosition);
+    vec3 query = queryPosition(rayDir, samplePosition);
     float scale = max(uCloudScale, 0.05);
-    float coarse = fbm(domainDir * (4.5 * scale));
-    float fine = fbm(domainDir * (8.2 * scale) + vec3(8.0, 31.0, -15.0));
+    vec3 p = (query - uSkyCenter) / max(uSkyRadius, 1e-4);
+    float coarse = fbm(p * (4.5 * scale));
+    float fine = fbm(p * (8.2 * scale) + vec3(8.0, 31.0, -15.0));
     return clamp((coarse - fine * 0.34) * 1.15, 0.0, 1.0);
 }
 
@@ -183,7 +190,7 @@ vec3 aurora(vec3 rayDir, vec3 samplePosition) {
     vec3 color = nightBase(rayDir, samplePosition, false);
     if (rayDir.y < 0.01) return color;
 
-    vec3 domainDir = localDomainDirection(rayDir, samplePosition);
+    vec3 domainDir = queryDirection(rayDir, samplePosition);
     float azimuth = atan(domainDir.z, domainDir.x);
     float elevation = asin(clamp(rayDir.y, -1.0, 1.0));
 
@@ -221,10 +228,19 @@ vec3 aurora(vec3 rayDir, vec3 samplePosition) {
     return max(color, vec3(0.0));
 }
 
+vec3 syntheticWorldField(vec3 rayDir, vec3 samplePosition) {
+    vec3 q = (queryPosition(rayDir, samplePosition) - uSkyCenter) / max(uSkyRadius, 1e-4);
+    vec3 bands = 0.5 + 0.5 * sin(vec3(11.0 * q.x + 3.0 * q.z, 9.0 * q.y - 4.0 * q.x, 13.0 * q.z + 2.0 * q.y));
+    float cells = mod(floor((q.x + 2.0) * 6.0) + floor((q.z + 2.0) * 6.0), 2.0);
+    vec3 checker = mix(vec3(0.10, 0.18, 0.72), vec3(0.95, 0.38, 0.08), cells);
+    return mix(checker, bands, 0.55);
+}
+
 vec3 proceduralSky(vec3 rayDir, vec3 samplePosition) {
     rayDir = normalize(rayDir);
     if (uSkyMode == 1) return nightBase(rayDir, samplePosition, true);
     if (uSkyMode == 2) return aurora(rayDir, samplePosition);
+    if (uSkyMode == 3) return syntheticWorldField(rayDir, samplePosition);
     return daySky(rayDir, samplePosition);
 }
 
@@ -255,14 +271,20 @@ vec3 reconstructWorld(float depth) {
 vec3 skyForRay(vec3 origin, vec3 direction, out vec3 samplePosition) {
     direction = normalize(direction);
 
-    // Direction-only baseline: the radiance query depends on direction, not ray origin.
+    // 0: direction-only baseline. The synthesized coordinate is independent of ray origin.
     samplePosition = uSkyCenter + direction * uSkyRadius;
 
-    // Proposed method: evaluate the same radiance function at the actual local-domain hit.
-    if (uMethod != 0) {
+    // 1: legacy fixed world-space spherical domain, retained only for comparison.
+    if (uMethod == 1) {
         vec3 localHit;
         if (sphereIntersection(origin, direction, localHit)) samplePosition = localHit;
     }
+
+    // 2/3: proposed per-origin virtual sphere. The virtual sampling shell is centered
+    // at the ray origin, so for normalized d the query is exactly q = o + R d.
+    // No quadratic equation, square root, or root selection is required.
+    if (uMethod >= 2) samplePosition = origin + direction * uSkyRadius;
+
     return proceduralSky(direction, samplePosition);
 }
 
@@ -287,10 +309,17 @@ void main() {
     }
 
     vec3 base = texture(uSceneColor, vUv).rgb;
+    if (uObjectReflections == 0) {
+        oDomainHit = vec4(0.0);
+        oLinearColor = vec4(base, 1.0);
+        oColor = vec4(displayMap(base), 1.0);
+        return;
+    }
+
     vec4 normalRoughness = texture(uNormalRoughness, vUv);
     vec3 normal = normalize(normalRoughness.xyz * 2.0 - 1.0);
     float roughness = clamp(normalRoughness.w, 0.0, 1.0);
-    vec3 world = reconstructWorld(depth);
+    vec3 world = uMethod == 3 ? texture(uWorldPosition, vUv).xyz : reconstructWorld(depth);
     vec3 incident = normalize(world - uEye);
     vec3 reflected = reflect(incident, normal);
     vec3 samplePosition;

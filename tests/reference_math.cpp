@@ -1,4 +1,3 @@
-#include <array>
 #include <cmath>
 #include <iostream>
 
@@ -16,6 +15,10 @@ namespace {
     double dot(const Vec3 a, const Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
     double length(const Vec3 value) { return std::sqrt(dot(value, value)); }
     Vec3 normalize(const Vec3 value) { return value * (1.0 / length(value)); }
+
+    Vec3 perOriginSphere(const Vec3 origin, const Vec3 direction, const double radius) {
+        return origin + normalize(direction) * radius;
+    }
 
     bool intersectSphere(
         const Vec3 origin,
@@ -45,27 +48,31 @@ namespace {
     }
 
     bool run() {
-        Vec3 hit;
-        if (!intersectSphere({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, 3.0, hit)) return false;
-        if (!close(hit, {3.0, 0.0, 0.0})) return false;
+        const Vec3 q0 = perOriginSphere({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 3.0);
+        if (!close(q0, {3.0, 0.0, 0.0})) return false;
 
-        if (!intersectSphere({-5.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, 2.0, hit)) return false;
-        if (!close(hit, {-2.0, 0.0, 0.0})) return false;
+        const Vec3 origin{2.0, -1.0, 4.0};
+        const Vec3 q1 = perOriginSphere(origin, {0.0, 2.0, 0.0}, 5.0);
+        if (!close(q1, {2.0, 4.0, 4.0})) return false;
+        if (std::abs(length(q1 - origin) - 5.0) > 1e-10) return false;
 
-        if (intersectSphere({-5.0, 5.0, 0.0}, {1.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, 2.0, hit)) return false;
+        const Vec3 a = perOriginSphere({0.0, 0.0, 0.0}, {1.0, 0.5, -0.25}, 10.0);
+        const Vec3 b = perOriginSphere({4.0, 1.0, -2.0}, {1.0, 0.5, -0.25}, 10.0);
+        if (!close(b - a, {4.0, 1.0, -2.0})) return false;
 
-        if (!intersectSphere({0.2, -0.3, 0.4}, {0.3, 0.7, -0.2}, {1.0, 2.0, -1.0}, 10.0, hit)) return false;
-        const double radiusError = std::abs(length(hit - Vec3{1.0, 2.0, -1.0}) - 10.0);
-        if (radiusError > 1e-10) return false;
+        // Legacy fixed-domain reference remains available only as a comparison implementation.
+        Vec3 fixedHit;
+        if (!intersectSphere({-5.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, 2.0, fixedHit)) return false;
+        if (!close(fixedHit, {-2.0, 0.0, 0.0})) return false;
         return true;
     }
 }
 
 int main() {
     if (!run()) {
-        std::cerr << "ray-sphere reference tests failed\n";
+        std::cerr << "virtual-sphere reference tests failed\n";
         return 1;
     }
-    std::cout << "ray-sphere reference tests passed\n";
+    std::cout << "virtual-sphere reference tests passed\n";
     return 0;
 }

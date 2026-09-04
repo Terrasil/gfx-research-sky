@@ -9,6 +9,7 @@ uniform vec3 uEye;
 
 layout(location = 0) out vec4 oColor;
 layout(location = 1) out vec4 oNormalRoughness;
+layout(location = 2) out vec4 oWorldPosition;
 
 void main() {
     vec3 n = normalize(vNormal);
@@ -25,4 +26,5 @@ void main() {
     vec3 diffuse = uBaseColor * (skyAmbient + ndl * 0.82);
     oColor = vec4(diffuse + vec3(specular), 1.0);
     oNormalRoughness = vec4(n * 0.5 + 0.5, uRoughness);
+    oWorldPosition = vec4(vWorld, 1.0);
 }
