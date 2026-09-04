@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 
 project(gfx-research-sky LANGUAGES C CXX)
 
-set(GFX_RESEARCH_BASE_GIT_TAG main CACHE STRING "gfx-research-base Git revision")
+set(GFX_RESEARCH_BASE_GIT_TAG v0.3 CACHE STRING "gfx-research-base Git revision")
 set(GFX_RESEARCH_BASE_LOCAL_PATH "" CACHE PATH "Optional local gfx-research-base checkout")
 
 if(GFX_RESEARCH_BASE_LOCAL_PATH)
