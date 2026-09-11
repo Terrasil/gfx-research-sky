@@ -156,12 +156,16 @@ def main() -> int:
     timing_groups: dict[str, list[dict[str, object]]] = defaultdict(list)
     for pair_id, methods in methods_by_pair.items():
         baseline = methods.get("direction-only")
-        proposed = methods.get("per-origin-sphere") or methods.get("per-origin-dome") or methods.get("local-ray")
+        fixed_domain = methods.get("fixed-domain-local-ray")
+        proposed = methods.get("origin-aware-fixed-distance") or methods.get("per-origin-sphere") or methods.get("per-origin-dome") or methods.get("local-ray")
         if not baseline or not proposed:
             continue
         baseline_ms = number(baseline.get("median_ms"))
+        fixed_domain_ms = number(fixed_domain.get("median_ms")) if fixed_domain else float("nan")
         proposed_ms = number(proposed.get("median_ms"))
         delta_us = (proposed_ms - baseline_ms) * 1000.0
+        fixed_delta_us = (fixed_domain_ms - baseline_ms) * 1000.0 if math.isfinite(fixed_domain_ms) else float("nan")
+        proposed_vs_fixed_us = (proposed_ms - fixed_domain_ms) * 1000.0 if math.isfinite(fixed_domain_ms) else float("nan")
         row: dict[str, object] = {
             "pair_id": pair_id,
             "group_id": baseline.get("group_id", pair_id),
@@ -177,13 +181,19 @@ def main() -> int:
             "null_test": baseline["null_test"],
             "reflections_enabled": baseline.get("reflections_enabled", "1"),
             "baseline_median_ms": baseline_ms,
+            "fixed_domain_median_ms": fixed_domain_ms,
             "proposed_median_ms": proposed_ms,
+            "fixed_domain_delta_us": fixed_delta_us,
             "delta_us": delta_us,
+            "proposed_vs_fixed_delta_us": proposed_vs_fixed_us,
             "baseline_world_position_rmse": number(baseline.get("world_position_rmse")),
+            "fixed_domain_world_position_rmse": number(fixed_domain.get("world_position_rmse")) if fixed_domain else float("nan"),
             "proposed_world_position_rmse": number(proposed.get("world_position_rmse")),
             "baseline_background_query_error": number(baseline.get("background_hit_error")),
+            "fixed_domain_background_query_error": number(fixed_domain.get("background_hit_error")) if fixed_domain else float("nan"),
             "proposed_background_query_error": number(proposed.get("background_hit_error")),
             "baseline_reflection_query_error": number(baseline.get("reflection_hit_error")),
+            "fixed_domain_reflection_query_error": number(fixed_domain.get("reflection_hit_error")) if fixed_domain else float("nan"),
             "proposed_reflection_query_error": number(proposed.get("reflection_hit_error")),
         }
         paired_rows.append(row)
@@ -195,9 +205,14 @@ def main() -> int:
     timing_aggregate: list[dict[str, object]] = []
     for group_id, rows in sorted(timing_groups.items()):
         deltas = [float(row["delta_us"]) for row in rows]
+        fixed_deltas = [float(row["fixed_domain_delta_us"]) for row in rows if math.isfinite(float(row["fixed_domain_delta_us"]))]
+        proposed_vs_fixed = [float(row["proposed_vs_fixed_delta_us"]) for row in rows if math.isfinite(float(row["proposed_vs_fixed_delta_us"]))]
         baseline_values = [float(row["baseline_median_ms"]) for row in rows]
+        fixed_values = [float(row["fixed_domain_median_ms"]) for row in rows if math.isfinite(float(row["fixed_domain_median_ms"]))]
         proposed_values = [float(row["proposed_median_ms"]) for row in rows]
         ci_low, ci_high = bootstrap_ci(deltas)
+        fixed_ci_low, fixed_ci_high = bootstrap_ci(fixed_deltas)
+        proposed_fixed_ci_low, proposed_fixed_ci_high = bootstrap_ci(proposed_vs_fixed)
         first = rows[0]
         mean_delta = sum(deltas) / len(deltas)
         variance = sum((value - mean_delta) ** 2 for value in deltas) / max(len(deltas) - 1, 1)
@@ -209,7 +224,11 @@ def main() -> int:
             "reflections_enabled": first.get("reflections_enabled", "1"),
             "repeats": len(deltas),
             "baseline_median_of_medians_ms": percentile(baseline_values, 0.5),
+            "fixed_domain_median_of_medians_ms": percentile(fixed_values, 0.5),
             "proposed_median_of_medians_ms": percentile(proposed_values, 0.5),
+            "fixed_domain_delta_median_us": percentile(fixed_deltas, 0.5),
+            "fixed_domain_delta_bootstrap_ci95_low_us": fixed_ci_low,
+            "fixed_domain_delta_bootstrap_ci95_high_us": fixed_ci_high,
             "paired_delta_median_us": percentile(deltas, 0.5),
             "paired_delta_mean_us": mean_delta,
             "paired_delta_stddev_us": math.sqrt(variance),
@@ -217,6 +236,9 @@ def main() -> int:
             "paired_delta_p95_us": percentile(deltas, 0.95),
             "paired_delta_bootstrap_ci95_low_us": ci_low,
             "paired_delta_bootstrap_ci95_high_us": ci_high,
+            "proposed_vs_fixed_delta_median_us": percentile(proposed_vs_fixed, 0.5),
+            "proposed_vs_fixed_delta_bootstrap_ci95_low_us": proposed_fixed_ci_low,
+            "proposed_vs_fixed_delta_bootstrap_ci95_high_us": proposed_fixed_ci_high,
         })
     write_rows(root / "timing_aggregate.csv", timing_aggregate)
 
@@ -234,15 +256,22 @@ def main() -> int:
         on = states.get("1")
         if not off or not on:
             continue
+        fixed_on = float(on.get("fixed_domain_median_of_medians_ms", float("nan")))
+        fixed_off = float(off.get("fixed_domain_median_of_medians_ms", float("nan")))
         reflection_toggle_rows.append({
             "group_id": normalized,
             "sky_mode": on["sky_mode"],
             "width": on["width"],
             "height": on["height"],
             "direction_only_reflection_cost_us": (float(on["baseline_median_of_medians_ms"]) - float(off["baseline_median_of_medians_ms"])) * 1000.0,
+            "fixed_domain_reflection_cost_us": (fixed_on - fixed_off) * 1000.0 if math.isfinite(fixed_on) and math.isfinite(fixed_off) else float("nan"),
             "proposed_reflection_cost_us": (float(on["proposed_median_of_medians_ms"]) - float(off["proposed_median_of_medians_ms"])) * 1000.0,
+            "fixed_domain_overhead_reflections_off_us": float(off.get("fixed_domain_delta_median_us", float("nan"))),
+            "fixed_domain_overhead_reflections_on_us": float(on.get("fixed_domain_delta_median_us", float("nan"))),
             "proposed_overhead_reflections_off_us": float(off["paired_delta_median_us"]),
             "proposed_overhead_reflections_on_us": float(on["paired_delta_median_us"]),
+            "proposed_vs_fixed_reflections_off_us": float(off.get("proposed_vs_fixed_delta_median_us", float("nan"))),
+            "proposed_vs_fixed_reflections_on_us": float(on.get("proposed_vs_fixed_delta_median_us", float("nan"))),
         })
     write_rows(root / "reflection_toggle_aggregate.csv", reflection_toggle_rows)
 
@@ -254,17 +283,34 @@ def main() -> int:
         key = (row["sky_mode"], row.get("metric_region", "full-frame"), row.get("reflections_enabled", "1"))
         quality_groups[key].append(row)
     for (sky_mode, metric_region, reflections_enabled), rows in sorted(quality_groups.items()):
-        baseline = [number(row["baseline_relative_rmse"]) for row in rows]
-        proposed = [number(row.get("proposed_relative_rmse") or row.get("local_relative_rmse")) for row in rows]
+        # New schema separates representation difference from reconstruction fidelity.
+        direction_to_origin = [number(row.get("direction_to_origin_ref_relative_rmse") or row.get("baseline_relative_rmse")) for row in rows]
+        fixed_to_origin = [number(row.get("fixed_domain_to_origin_ref_relative_rmse") or row.get("fixed_domain_relative_rmse")) for row in rows]
+        origin_to_origin = [number(row.get("origin_aware_to_origin_ref_relative_rmse") or row.get("proposed_relative_rmse") or row.get("local_relative_rmse")) for row in rows]
+        direction_reconstruction = [number(row.get("direction_reconstruction_relative_rmse")) for row in rows]
+        fixed_reconstruction = [number(row.get("fixed_domain_reconstruction_relative_rmse")) for row in rows]
+        origin_reconstruction = [number(row.get("origin_aware_reconstruction_relative_rmse") or row.get("proposed_relative_rmse") or row.get("local_relative_rmse")) for row in rows]
+        fixed_to_origin = [value for value in fixed_to_origin if math.isfinite(value)]
+        direction_reconstruction = [value for value in direction_reconstruction if math.isfinite(value)]
+        fixed_reconstruction = [value for value in fixed_reconstruction if math.isfinite(value)]
+        origin_reconstruction = [value for value in origin_reconstruction if math.isfinite(value)]
         quality_aggregate.append({
             "sky_mode": sky_mode,
             "metric_region": metric_region,
             "reflections_enabled": reflections_enabled,
             "cases": len(rows),
-            "baseline_relative_rmse_mean": sum(baseline) / len(baseline) if baseline else float("nan"),
-            "proposed_relative_rmse_mean": sum(proposed) / len(proposed) if proposed else float("nan"),
-            "baseline_relative_rmse_median": percentile(baseline, 0.5),
-            "proposed_relative_rmse_median": percentile(proposed, 0.5),
+            "direction_to_origin_ref_relative_rmse_mean": sum(direction_to_origin) / len(direction_to_origin) if direction_to_origin else float("nan"),
+            "fixed_domain_to_origin_ref_relative_rmse_mean": sum(fixed_to_origin) / len(fixed_to_origin) if fixed_to_origin else float("nan"),
+            "origin_aware_to_origin_ref_relative_rmse_mean": sum(origin_to_origin) / len(origin_to_origin) if origin_to_origin else float("nan"),
+            "direction_to_origin_ref_relative_rmse_median": percentile(direction_to_origin, 0.5),
+            "fixed_domain_to_origin_ref_relative_rmse_median": percentile(fixed_to_origin, 0.5),
+            "origin_aware_to_origin_ref_relative_rmse_median": percentile(origin_to_origin, 0.5),
+            "direction_reconstruction_relative_rmse_mean": sum(direction_reconstruction) / len(direction_reconstruction) if direction_reconstruction else float("nan"),
+            "fixed_domain_reconstruction_relative_rmse_mean": sum(fixed_reconstruction) / len(fixed_reconstruction) if fixed_reconstruction else float("nan"),
+            "origin_aware_reconstruction_relative_rmse_mean": sum(origin_reconstruction) / len(origin_reconstruction) if origin_reconstruction else float("nan"),
+            "direction_reconstruction_relative_rmse_median": percentile(direction_reconstruction, 0.5),
+            "fixed_domain_reconstruction_relative_rmse_median": percentile(fixed_reconstruction, 0.5),
+            "origin_aware_reconstruction_relative_rmse_median": percentile(origin_reconstruction, 0.5),
         })
     write_rows(root / "quality_aggregate.csv", quality_aggregate)
 
@@ -290,8 +336,11 @@ def main() -> int:
 
         for pair_id, methods in capture_methods.items():
             baseline = methods.get("direction-only")
-            proposed = methods.get("per-origin-sphere") or methods.get("per-origin-dome") or methods.get("local-ray")
-            reference = methods.get("explicit-position-reference")
+            fixed_domain = methods.get("fixed-domain-local-ray")
+            proposed = methods.get("origin-aware-fixed-distance") or methods.get("per-origin-sphere") or methods.get("per-origin-dome") or methods.get("local-ray")
+            reference = methods.get("origin-aware-explicit-position-reference") or methods.get("explicit-position-reference")
+            direction_reference = methods.get("direction-only-explicit-position-reference")
+            fixed_reference = methods.get("fixed-domain-explicit-position-reference")
             if baseline and proposed:
                 a = resolve(root, baseline.get("pfm", "")) if baseline.get("pfm") else None
                 b = resolve(root, proposed.get("pfm", "")) if proposed.get("pfm") else None
@@ -317,20 +366,41 @@ def main() -> int:
                 continue
             baseline_metrics = hdr_metrics(paths["baseline"], paths["reference"])
             proposed_metrics = hdr_metrics(paths["proposed"], paths["reference"])
+            direction_reconstruction_metrics = None
+            if direction_reference and direction_reference.get("pfm"):
+                direction_reference_path = resolve(root, direction_reference["pfm"])
+                if direction_reference_path.is_file():
+                    direction_reconstruction_metrics = hdr_metrics(paths["baseline"], direction_reference_path)
+            fixed_reconstruction_metrics = None
+            fixed_metrics = None
+            fixed_path = resolve(root, fixed_domain.get("pfm", "")) if fixed_domain and fixed_domain.get("pfm") else None
+            if fixed_path and fixed_path.is_file():
+                fixed_metrics = hdr_metrics(fixed_path, paths["reference"])
+                if fixed_reference and fixed_reference.get("pfm"):
+                    fixed_reference_path = resolve(root, fixed_reference["pfm"])
+                    if fixed_reference_path.is_file():
+                        fixed_reconstruction_metrics = hdr_metrics(fixed_path, fixed_reference_path)
             capture_quality.append({
                 "pair_id": pair_id,
                 "sky_mode": baseline["sky_mode"],
                 "sweep": baseline["sweep"],
                 "reflections_enabled": baseline.get("reflections_enabled", "1"),
                 "baseline_hdr_rmse": baseline_metrics["rmse"],
+                "fixed_domain_hdr_rmse": fixed_metrics["rmse"] if fixed_metrics else float("nan"),
                 "proposed_hdr_rmse": proposed_metrics["rmse"],
                 "baseline_relative_rmse": baseline_metrics["relative_rmse"],
+                "fixed_domain_relative_rmse": fixed_metrics["relative_rmse"] if fixed_metrics else float("nan"),
                 "proposed_relative_rmse": proposed_metrics["relative_rmse"],
                 "baseline_psnr_db": baseline_metrics["psnr_db"],
+                "fixed_domain_psnr_db": fixed_metrics["psnr_db"] if fixed_metrics else float("nan"),
                 "proposed_psnr_db": proposed_metrics["psnr_db"],
                 "baseline_ssim_display": ssim_if_available(paths["baseline"], paths["reference"]),
+                "fixed_domain_ssim_display": ssim_if_available(fixed_path, paths["reference"]) if fixed_path and fixed_path.is_file() else float("nan"),
                 "proposed_ssim_display": ssim_if_available(paths["proposed"], paths["reference"]),
-                "reference_kind": "explicit-position-gpu-ablation",
+                "direction_reconstruction_relative_rmse": direction_reconstruction_metrics["relative_rmse"] if direction_reconstruction_metrics else float("nan"),
+                "fixed_domain_reconstruction_relative_rmse": fixed_reconstruction_metrics["relative_rmse"] if fixed_reconstruction_metrics else float("nan"),
+                "origin_aware_reconstruction_relative_rmse": proposed_metrics["relative_rmse"],
+                "reference_kind": "origin-aware-explicit-position plus per-representation explicit-position references when available",
             })
     write_rows(root / "capture_quality.csv", capture_quality)
     write_rows(root / "null_results.csv", null_rows)

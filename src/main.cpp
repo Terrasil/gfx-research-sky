@@ -57,17 +57,20 @@ namespace {
     constexpr std::array<const char*, 3> METHOD_LABELS = {
         "Direction-only",
         "Fixed world sphere (legacy)",
-        "Per-origin virtual sphere"
+        "Origin-aware fixed-distance"
     };
 
     constexpr int METHOD_DIRECTION_ONLY = 0;
     constexpr int METHOD_FIXED_DOMAIN = 1;
-    constexpr int METHOD_PER_ORIGIN_SPHERE = 2;
-    constexpr int METHOD_EXPLICIT_POSITION_REFERENCE = 3;
+    constexpr int METHOD_ORIGIN_AWARE_FIXED_DISTANCE = 2;
+    constexpr int METHOD_ORIGIN_AWARE_EXPLICIT_POSITION_REFERENCE = 3;
+    constexpr int METHOD_FIXED_DOMAIN_EXPLICIT_POSITION_REFERENCE = 4;
+    constexpr int METHOD_DIRECTION_ONLY_EXPLICIT_POSITION_REFERENCE = 5;
 
     struct LaunchOptions {
         bool publicationSuite = false;
         bool publicationQuick = false;
+        bool publicationNullOnly = false;
         std::filesystem::path publicationOutput = "results/publication";
     };
 
@@ -78,7 +81,7 @@ namespace {
         int step = 0;
         int repeat = 0;
         int skyMode = 0;
-        int method = METHOD_PER_ORIGIN_SPHERE;
+        int method = METHOD_ORIGIN_AWARE_FIXED_DISTANCE;
         bool reflectionsEnabled = true;
         bool quality = false;
         bool nullTest = false;
@@ -202,7 +205,7 @@ namespace {
         return true;
     }
 
-    glm::dvec3 perOriginSphereReference(
+    glm::dvec3 fixedDistanceReference(
         const glm::dvec3& origin,
         const glm::dvec3& directionInput,
         const double radius
@@ -373,7 +376,7 @@ namespace {
             glEnable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
 
-            if (launchOptions_.publicationSuite || launchOptions_.publicationQuick) {
+            if (launchOptions_.publicationSuite || launchOptions_.publicationQuick || launchOptions_.publicationNullOnly) {
                 startPublicationSuite(!launchOptions_.publicationQuick);
             }
             return true;
@@ -606,7 +609,13 @@ namespace {
             }
 
             ImGui::SeparatorText("Method");
-            ImGui::Combo("Environment sampling", &method_, METHOD_LABELS.data(), static_cast<int>(METHOD_LABELS.size()));
+            int methodUi = method_;
+            if (method_ == METHOD_ORIGIN_AWARE_EXPLICIT_POSITION_REFERENCE) methodUi = METHOD_ORIGIN_AWARE_FIXED_DISTANCE;
+            if (method_ == METHOD_FIXED_DOMAIN_EXPLICIT_POSITION_REFERENCE) methodUi = METHOD_FIXED_DOMAIN;
+            if (method_ == METHOD_DIRECTION_ONLY_EXPLICIT_POSITION_REFERENCE) methodUi = METHOD_DIRECTION_ONLY;
+            if (ImGui::Combo("Environment sampling", &methodUi, METHOD_LABELS.data(), static_cast<int>(METHOD_LABELS.size())) && !publicationRunning_) {
+                method_ = methodUi;
+            }
             ImGui::Checkbox("Object sky reflections", &objectReflections_);
             ImGui::Checkbox("Spatially invariant null test", &nullTest_);
             ImGui::Checkbox("Record CSV", &record_);
@@ -678,6 +687,9 @@ namespace {
         void startPublicationSuite(const bool full) {
             stopPublicationSuite(false);
             publicationCases_ = makePublicationCases(full);
+            if (launchOptions_.publicationNullOnly) {
+                std::erase_if(publicationCases_, [](const PublicationCase& test) { return test.sweep != "null"; });
+            }
             publicationCaseIndex_ = 0;
             publicationCaseApplied_ = false;
             publicationRunning_ = !publicationCases_.empty();
@@ -695,11 +707,11 @@ namespace {
             publicationRaw_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,sample,gpu_ms,width,height,target_width,target_height,sky_radius,camera_offset_x,sphere_x,null_test,reflections_enabled\n";
             publicationSummary_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,samples,mean_ms,median_ms,stddev_ms,p95_ms,min_ms,max_ms,width,height,target_width,target_height,resolution_matched,sky_radius,camera_offset_x,sphere_x,null_test,reflections_enabled,world_position_rmse,background_hit_error,reflection_hit_error\n";
             publicationCaptures_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,width,height,reflections_enabled,png,pfm\n";
-            publicationQuality_ << "pair_id,group_id,sweep,step,sky_mode,width,height,sky_radius,camera_offset_x,sphere_x,reflections_enabled,metric_region,baseline_rmse,proposed_rmse,baseline_relative_rmse,proposed_relative_rmse,baseline_psnr_db,proposed_psnr_db,baseline_max_abs,proposed_max_abs\n";
+            publicationQuality_ << "pair_id,group_id,sweep,step,sky_mode,width,height,sky_radius,camera_offset_x,sphere_x,reflections_enabled,metric_region,roi_x0,roi_y0,roi_x1,roi_y1,direction_to_origin_ref_rmse,fixed_domain_to_origin_ref_rmse,origin_aware_to_origin_ref_rmse,direction_to_origin_ref_relative_rmse,fixed_domain_to_origin_ref_relative_rmse,origin_aware_to_origin_ref_relative_rmse,direction_to_origin_ref_psnr_db,fixed_domain_to_origin_ref_psnr_db,origin_aware_to_origin_ref_psnr_db,direction_to_origin_ref_max_abs,fixed_domain_to_origin_ref_max_abs,origin_aware_to_origin_ref_max_abs,direction_reconstruction_rmse,fixed_domain_reconstruction_rmse,origin_aware_reconstruction_rmse,direction_reconstruction_relative_rmse,fixed_domain_reconstruction_relative_rmse,origin_aware_reconstruction_relative_rmse,direction_reconstruction_psnr_db,fixed_domain_reconstruction_psnr_db,origin_aware_reconstruction_psnr_db,direction_reconstruction_max_abs,fixed_domain_reconstruction_max_abs,origin_aware_reconstruction_max_abs\n";
             publicationNull_ << "pair_id,sky_mode,width,height,reflections_enabled,linear_byte_identical,display_byte_identical,linear_rmse,linear_max_abs,display_rmse,display_max_abs\n";
             publicationManifest_
                 << "gfx-research-sky publication suite\n"
-                << "profile=" << (full ? "full" : "quick") << '\n'
+                << "profile=" << (launchOptions_.publicationNullOnly ? "null-only" : (full ? "full" : "quick")) << '\n'
                 << "frozen_time=" << frozenTime_ << '\n'
                 << "cloud_coverage=" << cloudCoverage_ << '\n'
                 << "cloud_scale=" << cloudScale_ << '\n'
@@ -707,11 +719,16 @@ namespace {
                 << "star_intensity=" << starIntensity_ << '\n'
                 << "aurora_intensity=" << auroraIntensity_ << '\n'
                 << "local_influence=" << localInfluence_ << '\n'
+                << "sky_center=" << skyCenter_.x << ',' << skyCenter_.y << ',' << skyCenter_.z << '\n'
                 << "timing_repeats=" << (full ? 10 : 2) << '\n'
                 << "offscreen_exact_resolution=1\n"
                 << "explicit_position_reference=1\n"
-                << "proposed_method=per-origin-virtual-sphere\n"
+                << "explicit_position_reference_per_representation=1\n"
+                << "proposed_method=origin-aware-fixed-distance\n"
+                << "publication_methods=direction-only,fixed-domain-local-ray,origin-aware-fixed-distance\n"
                 << "legacy_fixed_domain_available=1\n"
+                << "legacy_fixed_domain_measured=1\n"
+                << "reflection_origin_normal_offset=0\n"
                 << "reflection_toggle_timing=1\n"
                 << "dragon_loaded=" << dragonLoaded_ << '\n'
                 << "suzanne_loaded=" << suzanneLoaded_ << '\n'
@@ -733,7 +750,7 @@ namespace {
             }
             publicationRunning_ = false;
             publicationCaseApplied_ = false;
-            method_ = METHOD_PER_ORIGIN_SPHERE;
+            method_ = METHOD_ORIGIN_AWARE_FIXED_DISTANCE;
             objectReflections_ = true;
             int framebufferWidth = 0;
             int framebufferHeight = 0;
@@ -746,7 +763,11 @@ namespace {
             }
             publicationSamples_.clear();
             publicationBaselineImage_.clear();
+            publicationFixedDomainImage_.clear();
             publicationLocalImage_.clear();
+            publicationBaselineReferenceImage_.clear();
+            publicationFixedDomainReferenceImage_.clear();
+            publicationLocalReferenceImage_.clear();
             publicationQualityPairId_.clear();
             publicationNullPairId_.clear();
             publicationNullBaselineLinear_.clear();
@@ -771,8 +792,8 @@ namespace {
             const auto appendMethodPair = [&](PublicationCase base, const bool reverse = false) {
                 if (base.groupId.empty()) base.groupId = base.pairId;
                 const std::array<int, 2> order = reverse
-                    ? std::array<int, 2>{METHOD_PER_ORIGIN_SPHERE, METHOD_DIRECTION_ONLY}
-                    : std::array<int, 2>{METHOD_DIRECTION_ONLY, METHOD_PER_ORIGIN_SPHERE};
+                    ? std::array<int, 2>{METHOD_ORIGIN_AWARE_FIXED_DISTANCE, METHOD_DIRECTION_ONLY}
+                    : std::array<int, 2>{METHOD_DIRECTION_ONLY, METHOD_ORIGIN_AWARE_FIXED_DISTANCE};
                 for (const int method : order) {
                     PublicationCase test = base;
                     test.method = method;
@@ -780,13 +801,31 @@ namespace {
                 }
             };
 
-            const auto appendQualityTriple = [&](PublicationCase base) {
+            const auto appendMethodTriplet = [&](PublicationCase base, const int orderSeed = 0) {
+                if (base.groupId.empty()) base.groupId = base.pairId;
+                constexpr std::array<std::array<int, 3>, 3> orders = {{
+                    {METHOD_DIRECTION_ONLY, METHOD_FIXED_DOMAIN, METHOD_ORIGIN_AWARE_FIXED_DISTANCE},
+                    {METHOD_FIXED_DOMAIN, METHOD_ORIGIN_AWARE_FIXED_DISTANCE, METHOD_DIRECTION_ONLY},
+                    {METHOD_ORIGIN_AWARE_FIXED_DISTANCE, METHOD_DIRECTION_ONLY, METHOD_FIXED_DOMAIN}
+                }};
+                const auto& order = orders[static_cast<std::size_t>(orderSeed % static_cast<int>(orders.size()))];
+                for (const int method : order) {
+                    PublicationCase test = base;
+                    test.method = method;
+                    cases.push_back(std::move(test));
+                }
+            };
+
+            const auto appendQualitySet = [&](PublicationCase base) {
                 if (base.groupId.empty()) base.groupId = base.pairId;
                 base.quality = true;
                 for (const int method : {
                     METHOD_DIRECTION_ONLY,
-                    METHOD_PER_ORIGIN_SPHERE,
-                    METHOD_EXPLICIT_POSITION_REFERENCE
+                    METHOD_FIXED_DOMAIN,
+                    METHOD_ORIGIN_AWARE_FIXED_DISTANCE,
+                    METHOD_DIRECTION_ONLY_EXPLICIT_POSITION_REFERENCE,
+                    METHOD_FIXED_DOMAIN_EXPLICIT_POSITION_REFERENCE,
+                    METHOD_ORIGIN_AWARE_EXPLICIT_POSITION_REFERENCE
                 }) {
                     PublicationCase test = base;
                     test.method = method;
@@ -812,7 +851,7 @@ namespace {
                         test.warmupFrames = timingWarmup;
                         test.sampleFrames = timingSamples;
                         test.capture = false;
-                        appendMethodPair(test, (repeat & 1) != 0);
+                        appendMethodTriplet(test, repeat);
                     }
                 }
             };
@@ -844,7 +883,7 @@ namespace {
                     test.warmupFrames = sweepWarmup;
                     test.sampleFrames = sweepSamples;
                     test.capture = mode == 0 && (step == 0 || step == translationSteps / 2 || step == translationSteps - 1);
-                    appendMethodPair(test);
+                    appendMethodTriplet(test, step);
                 }
             }
 
@@ -864,7 +903,7 @@ namespace {
                     test.warmupFrames = sweepWarmup;
                     test.sampleFrames = sweepSamples;
                     test.capture = false;
-                    appendMethodPair(test);
+                    appendMethodTriplet(test, step);
                 }
             }
 
@@ -883,7 +922,7 @@ namespace {
                     test.skyRadius = radii[step];
                     test.warmupFrames = radiusWarmup;
                     test.sampleFrames = radiusSamples;
-                    appendMethodPair(test);
+                    appendMethodTriplet(test, step);
                 }
             }
 
@@ -901,7 +940,9 @@ namespace {
                     test.warmupFrames = nullWarmup;
                     test.sampleFrames = nullSamples;
                     test.capture = false;
-                    appendMethodPair(test);
+                    // Null validation is an exact image comparison, not a timing-order experiment.
+                    // Keep the direction-only image first so the comparison is recorded for every sky mode.
+                    appendMethodPair(test, false);
                 }
             };
 
@@ -935,7 +976,7 @@ namespace {
                     test.capture = mode == 0
                         ? (step == 0 || step == qualitySteps / 2 || step == qualitySteps - 1)
                         : (step == qualitySteps / 2);
-                    appendQualityTriple(test);
+                    appendQualitySet(test);
                 }
             }
 
@@ -960,7 +1001,7 @@ namespace {
                     test.capture = mode == 0
                         ? (step == 0 || step == reflectionQualitySteps / 2 || step == reflectionQualitySteps - 1)
                         : (step == reflectionQualitySteps / 2);
-                    appendQualityTriple(test);
+                    appendQualitySet(test);
                 }
             }
 
@@ -982,7 +1023,7 @@ namespace {
                 background.warmupFrames = sweepWarmup;
                 background.sampleFrames = sweepSamples;
                 background.capture = step == 0 || step == syntheticSteps / 2 || step == syntheticSteps - 1;
-                appendMethodPair(background);
+                appendMethodTriplet(background, step);
 
                 PublicationCase reflection = background;
                 reflection.pairId = std::string("synthetic-object-x-") + scalarToken(offset);
@@ -992,7 +1033,7 @@ namespace {
                 reflection.cameraOffsetX = 0.0f;
                 reflection.sphereX = offset * 0.5f;
                 reflection.capture = false;
-                appendMethodPair(reflection);
+                appendMethodTriplet(reflection, step);
             }
 
             return cases;
@@ -1069,7 +1110,7 @@ namespace {
                 std::cout << "Publication suite complete. Analyze with: python tools/analyze_publication.py "
                           << publicationOutput_.string() << '\n';
                 stopPublicationSuite(true);
-                if (launchOptions_.publicationSuite || launchOptions_.publicationQuick) close();
+                if (launchOptions_.publicationSuite || launchOptions_.publicationQuick || launchOptions_.publicationNullOnly) close();
             }
         }
 
@@ -1112,19 +1153,46 @@ namespace {
             if (test.method == METHOD_DIRECTION_ONLY) {
                 publicationQualityPairId_ = test.pairId;
                 publicationBaselineImage_ = image;
+                publicationFixedDomainImage_.clear();
                 publicationLocalImage_.clear();
+                publicationBaselineReferenceImage_.clear();
+                publicationFixedDomainReferenceImage_.clear();
+                publicationLocalReferenceImage_.clear();
                 return;
             }
-            if (test.method == METHOD_PER_ORIGIN_SPHERE) {
-                if (publicationQualityPairId_ == test.pairId) publicationLocalImage_ = image;
+            if (publicationQualityPairId_ != test.pairId) return;
+            if (test.method == METHOD_FIXED_DOMAIN) {
+                publicationFixedDomainImage_ = image;
                 return;
             }
-            if (test.method != METHOD_EXPLICIT_POSITION_REFERENCE || publicationQualityPairId_ != test.pairId) return;
-            if (publicationBaselineImage_.empty() || publicationLocalImage_.empty()) return;
+            if (test.method == METHOD_ORIGIN_AWARE_FIXED_DISTANCE) {
+                publicationLocalImage_ = image;
+                return;
+            }
+            if (test.method == METHOD_DIRECTION_ONLY_EXPLICIT_POSITION_REFERENCE) {
+                publicationBaselineReferenceImage_ = image;
+                return;
+            }
+            if (test.method == METHOD_FIXED_DOMAIN_EXPLICIT_POSITION_REFERENCE) {
+                publicationFixedDomainReferenceImage_ = image;
+                return;
+            }
+            if (test.method != METHOD_ORIGIN_AWARE_EXPLICIT_POSITION_REFERENCE) return;
+            publicationLocalReferenceImage_ = image;
+            if (
+                publicationBaselineImage_.empty()
+                || publicationFixedDomainImage_.empty()
+                || publicationLocalImage_.empty()
+                || publicationBaselineReferenceImage_.empty()
+                || publicationFixedDomainReferenceImage_.empty()
+                || publicationLocalReferenceImage_.empty()
+            ) return;
 
-            ImageMetrics baseline;
-            ImageMetrics local;
             const bool reflectionRegion = test.sweep == "reflection_image_quality";
+            int roiX0 = 0;
+            int roiY0 = 0;
+            int roiX1 = width;
+            int roiY1 = height;
             if (reflectionRegion) {
                 const float aspect = static_cast<float>(width) / static_cast<float>(height);
                 const glm::mat4 viewProjection = camera_.view_projection(aspect);
@@ -1133,31 +1201,53 @@ namespace {
                 const int centerX = std::clamp(static_cast<int>((ndc.x * 0.5f + 0.5f) * width), 0, width - 1);
                 const int centerY = std::clamp(static_cast<int>((ndc.y * 0.5f + 0.5f) * height), 0, height - 1);
                 const int halfExtent = std::max(32, height / 7);
-                baseline = calculateImageMetricsRegion(
-                    publicationBaselineImage_, image, width, height,
-                    centerX - halfExtent, centerY - halfExtent, centerX + halfExtent, centerY + halfExtent
-                );
-                local = calculateImageMetricsRegion(
-                    publicationLocalImage_, image, width, height,
-                    centerX - halfExtent, centerY - halfExtent, centerX + halfExtent, centerY + halfExtent
-                );
-            } else {
-                baseline = calculateImageMetrics(publicationBaselineImage_, image, width, height);
-                local = calculateImageMetrics(publicationLocalImage_, image, width, height);
+                roiX0 = std::clamp(centerX - halfExtent, 0, width);
+                roiY0 = std::clamp(centerY - halfExtent, 0, height);
+                roiX1 = std::clamp(centerX + halfExtent, roiX0, width);
+                roiY1 = std::clamp(centerY + halfExtent, roiY0, height);
             }
+
+            const auto metrics = [&](const std::vector<float>& tested, const std::vector<float>& reference) {
+                return reflectionRegion
+                    ? calculateImageMetricsRegion(tested, reference, width, height, roiX0, roiY0, roiX1, roiY1)
+                    : calculateImageMetrics(tested, reference, width, height);
+            };
+
+            // Representation-difference diagnostic: all paths are compared to the origin-aware
+            // explicit-position path. These values are not an absolute image-quality ranking.
+            const ImageMetrics directionToOrigin = metrics(publicationBaselineImage_, publicationLocalReferenceImage_);
+            const ImageMetrics fixedToOrigin = metrics(publicationFixedDomainImage_, publicationLocalReferenceImage_);
+            const ImageMetrics originToOrigin = metrics(publicationLocalImage_, publicationLocalReferenceImage_);
+
+            // Reconstruction fidelity: each representation is compared with its own explicit-position
+            // counterpart so representation differences are not conflated with depth reconstruction error.
+            const ImageMetrics directionReconstruction = metrics(publicationBaselineImage_, publicationBaselineReferenceImage_);
+            const ImageMetrics fixedReconstruction = metrics(publicationFixedDomainImage_, publicationFixedDomainReferenceImage_);
+            const ImageMetrics originReconstruction = originToOrigin;
+
             publicationQuality_
                 << test.pairId << ',' << test.groupId << ',' << test.sweep << ',' << test.step << ','
                 << SKY_MODE_IDS[static_cast<std::size_t>(test.skyMode)] << ',' << width << ',' << height << ','
                 << test.skyRadius << ',' << test.cameraOffsetX << ',' << test.sphereX << ','
                 << (test.reflectionsEnabled ? 1 : 0) << ','
                 << (reflectionRegion ? "reflection-roi" : "full-frame") << ','
-                << std::setprecision(12) << baseline.rmse << ',' << local.rmse << ','
-                << baseline.relativeRmse << ',' << local.relativeRmse << ','
-                << baseline.psnr << ',' << local.psnr << ','
-                << baseline.maximumAbsolute << ',' << local.maximumAbsolute << '\n';
+                << roiX0 << ',' << roiY0 << ',' << roiX1 << ',' << roiY1 << ','
+                << std::setprecision(12)
+                << directionToOrigin.rmse << ',' << fixedToOrigin.rmse << ',' << originToOrigin.rmse << ','
+                << directionToOrigin.relativeRmse << ',' << fixedToOrigin.relativeRmse << ',' << originToOrigin.relativeRmse << ','
+                << directionToOrigin.psnr << ',' << fixedToOrigin.psnr << ',' << originToOrigin.psnr << ','
+                << directionToOrigin.maximumAbsolute << ',' << fixedToOrigin.maximumAbsolute << ',' << originToOrigin.maximumAbsolute << ','
+                << directionReconstruction.rmse << ',' << fixedReconstruction.rmse << ',' << originReconstruction.rmse << ','
+                << directionReconstruction.relativeRmse << ',' << fixedReconstruction.relativeRmse << ',' << originReconstruction.relativeRmse << ','
+                << directionReconstruction.psnr << ',' << fixedReconstruction.psnr << ',' << originReconstruction.psnr << ','
+                << directionReconstruction.maximumAbsolute << ',' << fixedReconstruction.maximumAbsolute << ',' << originReconstruction.maximumAbsolute << '\n';
             publicationQuality_.flush();
             publicationBaselineImage_.clear();
+            publicationFixedDomainImage_.clear();
             publicationLocalImage_.clear();
+            publicationBaselineReferenceImage_.clear();
+            publicationFixedDomainReferenceImage_.clear();
+            publicationLocalReferenceImage_.clear();
             publicationQualityPairId_.clear();
         }
 
@@ -1170,7 +1260,7 @@ namespace {
                 publicationNullBaselineDisplay_ = display;
                 return;
             }
-            if (test.method != METHOD_PER_ORIGIN_SPHERE || publicationNullPairId_ != test.pairId) return;
+            if (test.method != METHOD_ORIGIN_AWARE_FIXED_DISTANCE || publicationNullPairId_ != test.pairId) return;
             const ImageMetrics linearMetrics = calculateImageMetrics(publicationNullBaselineLinear_, linear, width, height);
             const ImageMetrics displayMetrics = calculateImageMetrics(publicationNullBaselineDisplay_, display, width, height);
             const bool linearIdentical = publicationNullBaselineLinear_.size() == linear.size()
@@ -1249,7 +1339,7 @@ namespace {
             const glm::dvec3 farPoint = reconstructWorldReference(x, y, 1.0, width, height, inverseViewProjection);
             const glm::dvec3 origin = glm::dvec3(camera_.position());
             const glm::dvec3 direction = glm::normalize(farPoint - origin);
-            const glm::dvec3 expected = perOriginSphereReference(origin, direction, skyRadius_);
+            const glm::dvec3 expected = fixedDistanceReference(origin, direction, skyRadius_);
             return glm::length(glm::dvec3(gpuHit) - expected);
         }
 
@@ -1273,9 +1363,9 @@ namespace {
             const glm::dvec3 eye = glm::dvec3(camera_.position());
             const glm::dvec3 incident = glm::normalize(world - eye);
             const glm::dvec3 reflected = glm::reflect(incident, normal);
-            const glm::dvec3 origin = world + normal * 0.002;
+            const glm::dvec3 origin = world;
 
-            const glm::dvec3 expected = perOriginSphereReference(origin, reflected, skyRadius_);
+            const glm::dvec3 expected = fixedDistanceReference(origin, reflected, skyRadius_);
 
             const glm::vec4 gpuHit = readRgba(postTarget_.color(1), x, y);
             if (gpuHit.w < 0.5f) return std::numeric_limits<double>::quiet_NaN();
@@ -1338,8 +1428,10 @@ namespace {
         static const char* methodId(const int method) {
             switch (method) {
                 case METHOD_FIXED_DOMAIN: return "fixed-domain-local-ray";
-                case METHOD_PER_ORIGIN_SPHERE: return "per-origin-sphere";
-                case METHOD_EXPLICIT_POSITION_REFERENCE: return "explicit-position-reference";
+                case METHOD_ORIGIN_AWARE_FIXED_DISTANCE: return "origin-aware-fixed-distance";
+                case METHOD_ORIGIN_AWARE_EXPLICIT_POSITION_REFERENCE: return "origin-aware-explicit-position-reference";
+                case METHOD_FIXED_DOMAIN_EXPLICIT_POSITION_REFERENCE: return "fixed-domain-explicit-position-reference";
+                case METHOD_DIRECTION_ONLY_EXPLICIT_POSITION_REFERENCE: return "direction-only-explicit-position-reference";
                 default: return "direction-only";
             }
         }
@@ -1383,7 +1475,7 @@ namespace {
         float sphereRoughness_ = 0.05f;
         float floorRoughness_ = 0.38f;
         int skyMode_ = 0;
-        int method_ = METHOD_PER_ORIGIN_SPHERE;
+        int method_ = METHOD_ORIGIN_AWARE_FIXED_DISTANCE;
         bool objectReflections_ = true;
         bool nullTest_ = false;
         bool record_ = false;
@@ -1407,7 +1499,11 @@ namespace {
         std::ofstream publicationNull_;
         std::ofstream publicationManifest_;
         std::vector<float> publicationBaselineImage_;
+        std::vector<float> publicationFixedDomainImage_;
         std::vector<float> publicationLocalImage_;
+        std::vector<float> publicationBaselineReferenceImage_;
+        std::vector<float> publicationFixedDomainReferenceImage_;
+        std::vector<float> publicationLocalReferenceImage_;
         std::string publicationQualityPairId_;
         std::vector<float> publicationNullBaselineLinear_;
         std::vector<float> publicationNullBaselineDisplay_;
@@ -1430,6 +1526,8 @@ namespace {
                 options.publicationSuite = true;
             } else if (argument == "--publication-quick") {
                 options.publicationQuick = true;
+            } else if (argument == "--publication-null-only") {
+                options.publicationNullOnly = true;
             } else if (argument.starts_with("--publication-output=")) {
                 options.publicationOutput = std::string(argument.substr(std::string_view("--publication-output=").size()));
             }

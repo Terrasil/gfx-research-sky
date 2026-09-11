@@ -16,7 +16,7 @@ namespace {
     double length(const Vec3 value) { return std::sqrt(dot(value, value)); }
     Vec3 normalize(const Vec3 value) { return value * (1.0 / length(value)); }
 
-    Vec3 perOriginSphere(const Vec3 origin, const Vec3 direction, const double radius) {
+    Vec3 fixedDistanceQuery(const Vec3 origin, const Vec3 direction, const double radius) {
         return origin + normalize(direction) * radius;
     }
 
@@ -48,17 +48,28 @@ namespace {
     }
 
     bool run() {
-        const Vec3 q0 = perOriginSphere({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 3.0);
+        const Vec3 q0 = fixedDistanceQuery({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 3.0);
         if (!close(q0, {3.0, 0.0, 0.0})) return false;
 
         const Vec3 origin{2.0, -1.0, 4.0};
-        const Vec3 q1 = perOriginSphere(origin, {0.0, 2.0, 0.0}, 5.0);
+        const Vec3 q1 = fixedDistanceQuery(origin, {0.0, 2.0, 0.0}, 5.0);
         if (!close(q1, {2.0, 4.0, 4.0})) return false;
         if (std::abs(length(q1 - origin) - 5.0) > 1e-10) return false;
 
-        const Vec3 a = perOriginSphere({0.0, 0.0, 0.0}, {1.0, 0.5, -0.25}, 10.0);
-        const Vec3 b = perOriginSphere({4.0, 1.0, -2.0}, {1.0, 0.5, -0.25}, 10.0);
+        const Vec3 a = fixedDistanceQuery({0.0, 0.0, 0.0}, {1.0, 0.5, -0.25}, 10.0);
+        const Vec3 b = fixedDistanceQuery({4.0, 1.0, -2.0}, {1.0, 0.5, -0.25}, 10.0);
         if (!close(b - a, {4.0, 1.0, -2.0})) return false;
+
+        // General sensitivity identity for normalized directions:
+        // Delta q = Delta o + R Delta d.
+        const Vec3 o1{-2.0, 1.0, 3.0};
+        const Vec3 o2{1.0, -4.0, 5.0};
+        const Vec3 d1 = normalize({1.0, 2.0, 3.0});
+        const Vec3 d2 = normalize({-1.0, 3.0, 2.0});
+        constexpr double r = 7.0;
+        const Vec3 qa = fixedDistanceQuery(o1, d1, r);
+        const Vec3 qb = fixedDistanceQuery(o2, d2, r);
+        if (!close(qb - qa, (o2 - o1) + (d2 - d1) * r)) return false;
 
         // Legacy fixed-domain reference remains available only as a comparison implementation.
         Vec3 fixedHit;
@@ -70,9 +81,9 @@ namespace {
 
 int main() {
     if (!run()) {
-        std::cerr << "virtual-sphere reference tests failed\n";
+        std::cerr << "fixed-distance reference tests failed\n";
         return 1;
     }
-    std::cout << "virtual-sphere reference tests passed\n";
+    std::cout << "fixed-distance reference tests passed\n";
     return 0;
 }

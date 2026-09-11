@@ -268,22 +268,34 @@ vec3 reconstructWorld(float depth) {
     return world.xyz / world.w;
 }
 
+int representationMethod() {
+    if (uMethod == 3) return 2;
+    if (uMethod == 4) return 1;
+    if (uMethod == 5) return 0;
+    return uMethod;
+}
+
+bool usesExplicitWorldPosition() {
+    return uMethod >= 3;
+}
+
 vec3 skyForRay(vec3 origin, vec3 direction, out vec3 samplePosition) {
     direction = normalize(direction);
+    int representation = representationMethod();
 
-    // 0: direction-only baseline. The synthesized coordinate is independent of ray origin.
+    // 0: direction-only control. The synthesized coordinate is independent of ray origin.
     samplePosition = uSkyCenter + direction * uSkyRadius;
 
-    // 1: legacy fixed world-space spherical domain, retained only for comparison.
-    if (uMethod == 1) {
+    // 1: legacy fixed world-space spherical domain, retained as the closer comparator.
+    if (representation == 1) {
         vec3 localHit;
         if (sphereIntersection(origin, direction, localHit)) samplePosition = localHit;
     }
 
-    // 2/3: proposed per-origin virtual sphere. The virtual sampling shell is centered
-    // at the ray origin, so for normalized d the query is exactly q = o + R d.
-    // No quadratic equation, square root, or root selection is required.
-    if (uMethod >= 2) samplePosition = origin + direction * uSkyRadius;
+    // 2: origin-aware fixed-distance sampling. For normalized d, the procedural
+    // query is the point q = o + R d along the current environment ray.
+    // The equivalent origin-centered sphere is only a geometric interpretation.
+    if (representation == 2) samplePosition = origin + direction * uSkyRadius;
 
     return proceduralSky(direction, samplePosition);
 }
@@ -319,11 +331,11 @@ void main() {
     vec4 normalRoughness = texture(uNormalRoughness, vUv);
     vec3 normal = normalize(normalRoughness.xyz * 2.0 - 1.0);
     float roughness = clamp(normalRoughness.w, 0.0, 1.0);
-    vec3 world = uMethod == 3 ? texture(uWorldPosition, vUv).xyz : reconstructWorld(depth);
+    vec3 world = usesExplicitWorldPosition() ? texture(uWorldPosition, vUv).xyz : reconstructWorld(depth);
     vec3 incident = normalize(world - uEye);
     vec3 reflected = reflect(incident, normal);
     vec3 samplePosition;
-    vec3 reflectedSky = skyForRay(world + normal * 0.002, reflected, samplePosition);
+    vec3 reflectedSky = skyForRay(world, reflected, samplePosition);
     oDomainHit = vec4(samplePosition, 1.0);
 
     float fresnel = pow(1.0 - max(dot(normalize(uEye - world), normal), 0.0), 5.0);

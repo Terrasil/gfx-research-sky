@@ -51,7 +51,7 @@ if(BUILD_TESTING)
         tests/reference_math.cpp
     )
     target_compile_features(gfx-research-sky-reference-tests PRIVATE cxx_std_20)
-    add_test(NAME gfx-research-sky-virtual-sphere-reference COMMAND gfx-research-sky-reference-tests)
+    add_test(NAME gfx-research-sky-fixed-distance-reference COMMAND gfx-research-sky-reference-tests)
 endif()
 
 if(PROJECT_IS_TOP_LEVEL)
