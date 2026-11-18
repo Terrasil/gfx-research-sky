@@ -236,8 +236,16 @@ vec3 syntheticWorldField(vec3 rayDir, vec3 samplePosition) {
     return mix(checker, bands, 0.55);
 }
 
-vec3 proceduralSky(vec3 rayDir, vec3 samplePosition) {
+#include "volume.glsl"
+
+vec3 proceduralSky(vec3 rayDir, vec3 samplePosition, float angularFootprint) {
     rayDir = normalize(rayDir);
+    if (uSkyMode >= 4) {
+        bool night = uSkyMode != 4;
+        vec3 background = night ? nightBase(rayDir, samplePosition, false) : lomAtmosphere(rayDir);
+        if (uSkyMode == 6) background += volumetricAurora(rayDir, samplePosition, angularFootprint);
+        return lomClouds(background, rayDir, samplePosition, angularFootprint, night);
+    }
     if (uSkyMode == 1) return nightBase(rayDir, samplePosition, true);
     if (uSkyMode == 2) return aurora(rayDir, samplePosition);
     if (uSkyMode == 3) return syntheticWorldField(rayDir, samplePosition);
@@ -279,7 +287,7 @@ bool usesExplicitWorldPosition() {
     return uMethod >= 3;
 }
 
-vec3 skyForRay(vec3 origin, vec3 direction, out vec3 samplePosition) {
+vec3 skyForRay(vec3 origin, vec3 direction, float angularFootprint, out vec3 samplePosition) {
     direction = normalize(direction);
     int representation = representationMethod();
 
@@ -297,23 +305,33 @@ vec3 skyForRay(vec3 origin, vec3 direction, out vec3 samplePosition) {
     // The equivalent origin-centered sphere is only a geometric interpretation.
     if (representation == 2) samplePosition = origin + direction * uSkyRadius;
 
-    return proceduralSky(direction, samplePosition);
+    return proceduralSky(direction, samplePosition, angularFootprint);
 }
 
 vec3 displayMap(vec3 color) {
-    // Mild filmic compression keeps the sun and aurora readable on the default 8-bit framebuffer.
+    // HDR attachment stays linear. The default framebuffer needs an explicit
+    // sRGB transfer because the shared application does not enable FRAMEBUFFER_SRGB.
     color = max(color, vec3(0.0));
-    return color / (vec3(1.0) + color);
+    vec3 mapped = color / (vec3(1.0) + color);
+    return mix(1.055 * pow(mapped, vec3(1.0 / 2.4)) - 0.055,
+               12.92 * mapped, lessThanEqual(mapped, vec3(0.0031308)));
 }
 
 void main() {
     float depth = texture(uDepth, vUv).r;
     vec3 farPoint = reconstructWorld(1.0);
     vec3 viewRay = normalize(farPoint - uEye);
+    // Derivatives must be evaluated before visibility branches.
+    float viewFootprint = max(length(dFdxFine(viewRay)), length(dFdyFine(viewRay)));
+    vec3 worldForRay = usesExplicitWorldPosition() ? texture(uWorldPosition, vUv).xyz : reconstructWorld(depth);
+    vec3 encodedNormal = texture(uNormalRoughness, vUv).xyz * 2.0 - 1.0;
+    vec3 safeNormal = encodedNormal / max(length(encodedNormal), 1e-5);
+    vec3 reflectionForFootprint = reflect(normalize(worldForRay - uEye), safeNormal);
+    float reflectionFootprint = max(length(dFdxFine(reflectionForFootprint)), length(dFdyFine(reflectionForFootprint)));
 
     if (depth >= 0.999999) {
         vec3 samplePosition;
-        vec3 linearColor = skyForRay(uEye, viewRay, samplePosition);
+        vec3 linearColor = skyForRay(uEye, viewRay, viewFootprint, samplePosition);
         oLinearColor = vec4(linearColor, 1.0);
         oColor = vec4(displayMap(linearColor), 1.0);
         oDomainHit = vec4(samplePosition, 1.0);
@@ -335,7 +353,7 @@ void main() {
     vec3 incident = normalize(world - uEye);
     vec3 reflected = reflect(incident, normal);
     vec3 samplePosition;
-    vec3 reflectedSky = skyForRay(world, reflected, samplePosition);
+    vec3 reflectedSky = skyForRay(world, reflected, reflectionFootprint, samplePosition);
     oDomainHit = vec4(samplePosition, 1.0);
 
     float fresnel = pow(1.0 - max(dot(normalize(uEye - world), normal), 0.0), 5.0);

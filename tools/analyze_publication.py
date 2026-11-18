@@ -8,6 +8,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+DISPLAY_TRANSFER = "linear"
+
 
 def number(value: str | None) -> float:
     try:
@@ -67,7 +69,11 @@ def hdr_metrics(image_path: Path, reference_path: Path) -> dict[str, float]:
 def display_map(image):
     import numpy as np
     image = np.maximum(image, 0.0)
-    return np.clip(image / (1.0 + image), 0.0, 1.0)
+    mapped = np.clip(image / (1.0 + image), 0.0, 1.0)
+    if DISPLAY_TRANSFER == "srgb":
+        mapped = np.where(mapped <= 0.0031308, 12.92*mapped,
+                          1.055*np.power(mapped, 1.0/2.4)-0.055)
+    return mapped
 
 
 def save_preview(pfm_path: Path, png_path: Path) -> bool:
@@ -142,7 +148,12 @@ def write_rows(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 def main() -> int:
+    global DISPLAY_TRANSFER
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("results/publication")
+    manifest_path = root / "manifest.txt"
+    if manifest_path.is_file():
+        metadata = dict(line.split("=", 1) for line in manifest_path.read_text().splitlines() if "=" in line)
+        DISPLAY_TRANSFER = metadata.get("display_transfer", "linear")
     summary_path = root / "summary.csv"
     if not summary_path.is_file():
         raise SystemExit(f"Missing {summary_path}. Run the publication suite first.")
@@ -173,6 +184,11 @@ def main() -> int:
             "step": baseline["step"],
             "repeat": baseline.get("repeat", "0"),
             "sky_mode": baseline["sky_mode"],
+            "workload_family": baseline.get("workload_family", "legacy"),
+            "volume_budget": baseline.get("volume_budget", "none"),
+            "cloud_samples": baseline.get("cloud_samples", "0"),
+            "cloud_light_samples": baseline.get("cloud_light_samples", "0"),
+            "aurora_samples": baseline.get("aurora_samples", "0"),
             "width": baseline["width"],
             "height": baseline["height"],
             "sky_radius": baseline["sky_radius"],
@@ -197,7 +213,7 @@ def main() -> int:
             "proposed_reflection_query_error": number(proposed.get("reflection_hit_error")),
         }
         paired_rows.append(row)
-        if baseline["sweep"] == "timing":
+        if baseline["sweep"] in {"timing", "volume_budget"}:
             timing_groups[str(row["group_id"])].append(row)
 
     write_rows(root / "analysis.csv", paired_rows)
@@ -219,6 +235,11 @@ def main() -> int:
         timing_aggregate.append({
             "group_id": group_id,
             "sky_mode": first["sky_mode"],
+            "workload_family": first["workload_family"],
+            "volume_budget": first["volume_budget"],
+            "cloud_samples": first["cloud_samples"],
+            "cloud_light_samples": first["cloud_light_samples"],
+            "aurora_samples": first["aurora_samples"],
             "width": first["width"],
             "height": first["height"],
             "reflections_enabled": first.get("reflections_enabled", "1"),
@@ -261,6 +282,7 @@ def main() -> int:
         reflection_toggle_rows.append({
             "group_id": normalized,
             "sky_mode": on["sky_mode"],
+            "volume_budget": on["volume_budget"],
             "width": on["width"],
             "height": on["height"],
             "direction_only_reflection_cost_us": (float(on["baseline_median_of_medians_ms"]) - float(off["baseline_median_of_medians_ms"])) * 1000.0,

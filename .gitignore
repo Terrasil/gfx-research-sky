@@ -4,3 +4,7 @@ thirdparty/
 cmake-build-*/
 out/
 results/
+__pycache__/
+*.pyc
+imgui.ini
+build/

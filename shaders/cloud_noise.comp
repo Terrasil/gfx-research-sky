@@ -1,0 +1,49 @@
+#version 460 core
+// Deterministic, periodic shape/detail fields. Generated once, outside GPU timings.
+layout(local_size_x=8, local_size_y=8, local_size_z=8) in;
+layout(rg8, binding=0) writeonly uniform image3D uShape;
+layout(rg8, binding=1) writeonly uniform image3D uDetail;
+
+vec3 random3(ivec3 cell, int period) {
+    uvec3 p = uvec3((cell % period + period) % period);
+    uint h = p.x * 1597334677u ^ p.y * 3812015801u ^ p.z * 2798796415u ^ 91731u;
+    h ^= h >> 16; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+    uvec3 v = uvec3(h, h * 1664525u + 1013904223u, h * 22695477u + 1u);
+    return vec3(v & 0x00ffffffu) / 16777216.0;
+}
+float periodicValue(vec3 p, int period) {
+    ivec3 cell = ivec3(floor(p));
+    vec3 f = fract(p); f = f*f*(3.0-2.0*f);
+    float v = 0.0;
+    for(int z=0; z<2; ++z) for(int y=0; y<2; ++y) for(int x=0; x<2; ++x) {
+        vec3 w = mix(1.0-f, f, vec3(x,y,z));
+        v += random3(cell+ivec3(x,y,z),period).x*w.x*w.y*w.z;
+    }
+    return v;
+}
+float worley(vec3 uv, int period) {
+    vec3 p = uv*float(period), f = fract(p);
+    ivec3 cell = ivec3(floor(p));
+    float nearest = 4.0;
+    for(int z=-1; z<=1; ++z) for(int y=-1; y<=1; ++y) for(int x=-1; x<=1; ++x) {
+        ivec3 offset = ivec3(x,y,z);
+        vec3 d = vec3(offset)+random3(cell+offset,period)-f;
+        nearest = min(nearest,dot(d,d));
+    }
+    return clamp(1.0-sqrt(nearest),0.0,1.0);
+}
+void main() {
+    ivec3 cell = ivec3(gl_GlobalInvocationID);
+    ivec3 size = imageSize(uShape);
+    if(any(greaterThanEqual(cell,size))) return;
+    vec3 uv = (vec3(cell)+0.5)/vec3(size);
+    float value = periodicValue(uv*4.0,4)*0.5714286
+                + periodicValue(uv*8.0,8)*0.2857143
+                + periodicValue(uv*16.0,16)*0.1428571;
+    float w4=worley(uv,4), w8=worley(uv,8), w16=worley(uv,16);
+    float low = w4*0.625+w8*0.25+w16*0.125;
+    float shape = clamp((value*0.65+0.35-(1.0-low)*0.32)/0.68,0.0,1.0);
+    float w32=worley(uv,32), w64=worley(uv,64);
+    imageStore(uShape,cell,vec4(shape,low,0,1));
+    imageStore(uDetail,cell,vec4(w16*0.625+w32*0.25+w64*0.125,w32,0,1));
+}
