@@ -25,11 +25,17 @@ The directional control uses $\mathbf s_0+R\mathbf d$. The finite-sphere control
 The analytic slab uses constant extinction $\sigma=0.8$ over a finite ray interval $[a,b]$, with a varying source $S_e(t)=0.65+0.30\cos(\phi+\omega(t-a))$. The double-precision reference evaluates
 
 ```math
-L=L_{\rm bg}e^{-\sigma \ell}
- + C_e\left[0.65(1-e^{-\sigma\ell})
-    + 0.30\sigma\operatorname{Re}\left(
-       e^{i\phi}\frac{e^{(-\sigma+i\omega)\ell}-1}{-\sigma+i\omega}
-      \right)\right],\quad \ell=b-a.
+$$
+L = \mathrm{bg}\,e^{-\sigma \ell}
++ C_e \left[
+0.65(1 - e^{-\sigma \ell})
++ 0.30\sigma \,\mathrm{Re}\left(
+e^{i\phi}
+\frac{e^{(-\sigma + i\omega)\ell} - 1}{-\sigma + i\omega}
+\right)
+\right],
+\quad \ell = b-a.
+$$
 ```
 
 The GPU path integrates the same source with midpoint samples. The LOM cloud workloads use Beer-Lambert transmission and front-to-back integration. See [implementation notes](docs/IMPLEMENTATION.md) for volumetric cloud and aurora settings.
