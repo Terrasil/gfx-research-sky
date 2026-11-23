@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -44,29 +45,31 @@
 #include <glm/vec4.hpp>
 
 namespace {
-    constexpr std::array<const char*, 7> SKY_MODE_LABELS = {
+    constexpr std::array<const char*, 8> SKY_MODE_LABELS = {
         "Cheap / Day clouds",
         "Cheap / Night clouds",
         "Cheap / Aurora",
         "Synthetic world field",
         "LOM / Volumetric day",
         "LOM / Volumetric night",
-        "LOM / Clouds + 3D aurora"
+        "LOM / Clouds + 3D aurora",
+        "Analytic emissive slab"
     };
 
-    constexpr std::array<const char*, 7> SKY_MODE_IDS = {
+    constexpr std::array<const char*, 8> SKY_MODE_IDS = {
         "day-clouds",
         "night-clouds",
         "aurora",
         "world-field",
         "lom-volumetric-day",
         "lom-volumetric-night",
-        "lom-volumetric-aurora"
+        "lom-volumetric-aurora",
+        "analytic-slab"
     };
 
     constexpr std::array<int, 6> ENVIRONMENT_MODES{0, 1, 2, 4, 5, 6};
     constexpr std::array<int, 3> VOLUMETRIC_MODES{4, 5, 6};
-    const char* workloadFamily(int mode) { return mode >= 4 ? "volumetric" : (mode == 3 ? "synthetic" : "cheap"); }
+    const char* workloadFamily(int mode) { return mode >= 4 && mode <= 6 ? "volumetric" : (mode == 3 || mode == 7 ? "synthetic" : "cheap"); }
 
     constexpr std::array<const char*, 3> METHOD_LABELS = {
         "Direction-only",
@@ -87,6 +90,10 @@ namespace {
         bool publicationQuick = false;
         bool publicationNullOnly = false;
         bool publicationSmoke = false;
+
+        bool runsPublication() const {
+            return publicationSuite || publicationQuick || publicationNullOnly || publicationSmoke;
+        }
         std::string publicationFamily = "all";
         std::filesystem::path publicationOutput = "results/publication";
     };
@@ -106,6 +113,7 @@ namespace {
         int targetWidth = 1920;
         int targetHeight = 1080;
         float skyRadius = 300.0f;
+        float fieldScale = 0.0f;
         float cameraOffsetX = 0.0f;
         float sphereX = 0.0f;
         int warmupFrames = 120;
@@ -398,8 +406,9 @@ namespace {
             glEnable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
 
-            if (launchOptions_.publicationSuite || launchOptions_.publicationQuick || launchOptions_.publicationNullOnly || launchOptions_.publicationSmoke) {
-                startPublicationSuite(!launchOptions_.publicationQuick && !launchOptions_.publicationSmoke);
+            if (launchOptions_.runsPublication()) {
+                startPublicationSuite(!launchOptions_.publicationQuick && !launchOptions_.publicationSmoke,
+                    launchOptions_.publicationSmoke, launchOptions_.publicationNullOnly);
             }
             return true;
         }
@@ -543,6 +552,7 @@ namespace {
             skyShader_.set_vec3("uEye", camera_.position());
             skyShader_.set_vec3("uSkyCenter", skyCenter_);
             skyShader_.set_float("uSkyRadius", skyRadius_);
+            skyShader_.set_float("uFieldScaleRadius", fixedFieldScale_ ? fieldScaleRadius_ : skyRadius_);
             skyShader_.set_float("uSunElevation", sunElevation_);
             skyShader_.set_float("uCloudCoverage", cloudCoverage_);
             skyShader_.set_float("uCloudScale", cloudScale_);
@@ -627,18 +637,22 @@ namespace {
             gfx::research::save_framebuffer_png(filename, frame.width, frame.height);
         }
 
-        void startPublicationSuite(const bool full) {
+        void startPublicationSuite(const bool full, const bool smoke = false, const bool nullOnly = false) {
             stopPublicationSuite(false);
             resetBenchmarkParameters();
-            publicationCases_ = makePublicationCases(full);
+            publicationCases_ = makePublicationCases(full, smoke);
             publicationNullFailures_=0;
-            if (launchOptions_.publicationNullOnly) {
+            if (nullOnly) {
                 std::erase_if(publicationCases_, [](const PublicationCase& test) { return test.sweep != "null"; });
             }
             publicationCaseIndex_ = 0;
             publicationCaseApplied_ = false;
-            publicationRunning_ = !publicationCases_.empty();
             publicationOutput_ = launchOptions_.publicationOutput;
+            const std::string profile = nullOnly ? "null-only" : (smoke ? "smoke" : (full ? "full" : "quick"));
+            if (!launchOptions_.runsPublication()) {
+                const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
+                publicationOutput_ = std::filesystem::absolute(publicationOutput_ / (profile + "-" + std::to_string(stamp)));
+            }
             std::filesystem::create_directories(publicationOutput_ / "images");
             std::filesystem::create_directories(publicationOutput_ / "hdr");
 
@@ -648,15 +662,20 @@ namespace {
             publicationQuality_.open(publicationOutput_ / "quality.csv", std::ios::out | std::ios::trunc);
             publicationNull_.open(publicationOutput_ / "null.csv", std::ios::out | std::ios::trunc);
             publicationManifest_.open(publicationOutput_ / "manifest.txt", std::ios::out | std::ios::trunc);
+            if (!publicationRaw_ || !publicationSummary_ || !publicationCaptures_
+                || !publicationQuality_ || !publicationNull_ || !publicationManifest_) {
+                stopPublicationSuite(false);
+                throw std::runtime_error("Could not open benchmark outputs.");
+            }
 
-            publicationRaw_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,sample,gpu_ms,width,height,target_width,target_height,sky_radius,camera_offset_x,sphere_x,null_test,reflections_enabled,workload_family,volume_budget,cloud_samples,cloud_light_samples,cloud_empty_step,aurora_samples\n";
-            publicationSummary_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,samples,mean_ms,median_ms,stddev_ms,p95_ms,min_ms,max_ms,width,height,target_width,target_height,resolution_matched,sky_radius,camera_offset_x,sphere_x,null_test,reflections_enabled,world_position_rmse,background_hit_error,reflection_hit_error,workload_family,volume_budget,cloud_samples,cloud_light_samples,cloud_empty_step,aurora_samples\n";
+            publicationRaw_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,sample,gpu_ms,width,height,target_width,target_height,sky_radius,camera_offset_x,sphere_x,null_test,reflections_enabled,workload_family,volume_budget,cloud_samples,cloud_light_samples,cloud_empty_step,aurora_samples,field_scale\n";
+            publicationSummary_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,samples,mean_ms,median_ms,stddev_ms,p95_ms,min_ms,max_ms,width,height,target_width,target_height,resolution_matched,sky_radius,camera_offset_x,sphere_x,null_test,reflections_enabled,world_position_rmse,background_hit_error,reflection_hit_error,workload_family,volume_budget,cloud_samples,cloud_light_samples,cloud_empty_step,aurora_samples,field_scale\n";
             publicationCaptures_ << "case_id,pair_id,group_id,sweep,step,repeat,method,sky_mode,width,height,reflections_enabled,png,pfm\n";
             publicationQuality_ << "pair_id,group_id,sweep,step,sky_mode,width,height,sky_radius,camera_offset_x,sphere_x,reflections_enabled,metric_region,roi_x0,roi_y0,roi_x1,roi_y1,direction_to_origin_ref_rmse,fixed_domain_to_origin_ref_rmse,origin_aware_to_origin_ref_rmse,direction_to_origin_ref_relative_rmse,fixed_domain_to_origin_ref_relative_rmse,origin_aware_to_origin_ref_relative_rmse,direction_to_origin_ref_psnr_db,fixed_domain_to_origin_ref_psnr_db,origin_aware_to_origin_ref_psnr_db,direction_to_origin_ref_max_abs,fixed_domain_to_origin_ref_max_abs,origin_aware_to_origin_ref_max_abs,direction_reconstruction_rmse,fixed_domain_reconstruction_rmse,origin_aware_reconstruction_rmse,direction_reconstruction_relative_rmse,fixed_domain_reconstruction_relative_rmse,origin_aware_reconstruction_relative_rmse,direction_reconstruction_psnr_db,fixed_domain_reconstruction_psnr_db,origin_aware_reconstruction_psnr_db,direction_reconstruction_max_abs,fixed_domain_reconstruction_max_abs,origin_aware_reconstruction_max_abs\n";
             publicationNull_ << "pair_id,sky_mode,width,height,reflections_enabled,linear_byte_identical,display_byte_identical,linear_rmse,linear_max_abs,display_rmse,display_max_abs\n";
             publicationManifest_
                 << "gfx-research-sky publication suite\n"
-                << "schema_version=2\n"
+                << "schema_version=3\n"
                 << "display_transfer=srgb\n"
                 << "compiler=" << GFX_RESEARCH_COMPILER << '\n'
                 << "build_type=" << GFX_RESEARCH_BUILD_TYPE << '\n'
@@ -693,7 +712,7 @@ namespace {
                 << "aurora_width=" << volume_.auroraWidth << '\n'
                 << "aurora_speed=" << volume_.auroraSpeed << '\n'
                 << "volume_aurora_intensity=" << volume_.auroraIntensity << '\n'
-                << "profile=" << (launchOptions_.publicationNullOnly ? "null-only" : (launchOptions_.publicationSmoke ? "smoke" : (full ? "full" : "quick"))) << '\n'
+                << "profile=" << profile << '\n'
                 << "frozen_time=" << frozenTime_ << '\n'
                 << "cloud_coverage=" << cloudCoverage_ << '\n'
                 << "cloud_scale=" << cloudScale_ << '\n'
@@ -703,9 +722,9 @@ namespace {
                 << "local_influence=" << localInfluence_ << '\n'
                 << "sky_center=" << skyCenter_.x << ',' << skyCenter_.y << ',' << skyCenter_.z << '\n'
                 << "planned_cases=" << publicationCases_.size() << '\n'
-                << "timing_repeats=" << (launchOptions_.publicationSmoke ? 1 : (full ? 10 : 2)) << '\n'
-                << "timing_warmup_frames=" << (launchOptions_.publicationSmoke ? 8 : (full ? 120 : 30)) << '\n'
-                << "timing_samples=" << (launchOptions_.publicationSmoke ? 4 : (full ? 600 : 120)) << '\n'
+                << "timing_repeats=" << (smoke ? 1 : (full ? 10 : 2)) << '\n'
+                << "timing_warmup_frames=" << (smoke ? 8 : (full ? 120 : 30)) << '\n'
+                << "timing_samples=" << (smoke ? 4 : (full ? 600 : 120)) << '\n'
                 << "offscreen_exact_resolution=1\n"
                 << "explicit_position_reference=1\n"
                 << "explicit_position_reference_per_representation=1\n"
@@ -719,6 +738,13 @@ namespace {
                 << "suzanne_loaded=" << suzanneLoaded_ << '\n'
                 << "teapot_loaded=" << teapotLoaded_ << '\n';
 
+            publicationManifest_.flush();
+            publicationRunning_ = !publicationCases_.empty();
+            if (!publicationRunning_) {
+                stopPublicationSuite(false);
+                throw std::runtime_error("The selected suite has no cases.");
+            }
+            publicationMessage_ = "Benchmark running.";
             std::cout << "Publication suite started: " << publicationCases_.size() << " cases -> "
                       << publicationOutput_.string() << '\n';
         }
@@ -760,7 +786,7 @@ namespace {
             publicationNullBaselineDisplay_.clear();
         }
 
-        std::vector<PublicationCase> makePublicationCases(const bool full) const {
+        std::vector<PublicationCase> makePublicationCases(const bool full, const bool smoke) const {
             std::vector<PublicationCase> cases;
             const std::array<std::pair<int, int>, 3> fullResolutions = {{{1920, 1080}, {2560, 1440}, {3840, 2160}}};
             const std::array<std::pair<int, int>, 1> quickResolutions = {{{1920, 1080}}};
@@ -913,6 +939,24 @@ namespace {
                 }
             }
 
+            for (int mode : {0,3,4,6,7}) {
+                for (float radius : radii) for (bool fixed : {false,true}) {
+                    PublicationCase test;
+                    test.skyMode=mode;
+                    test.skyRadius=radius;
+                    test.fieldScale=fixed?30.0f:0.0f;
+                    test.sphereX=0.6f;
+                    test.cameraOffsetX=1.0f;
+                    test.sweep=fixed?"radius_fixed_scale":"radius_coupled_scale";
+                    test.pairId=std::string(SKY_MODE_IDS[mode])+'-'+test.sweep+'-'+scalarToken(radius);
+                    test.targetWidth=full?960:640;
+                    test.targetHeight=full?540:360;
+                    test.warmupFrames=4; test.sampleFrames=8;
+                    test.capture=true;
+                    appendMethodTriplet(test);
+                }
+            }
+
             const auto appendNullAtResolution = [&](const int width, const int height) {
                 for (const int mode : ENVIRONMENT_MODES) {
                     PublicationCase test;
@@ -1041,13 +1085,14 @@ namespace {
                 }
             }
             std::erase_if(cases, [&](const PublicationCase& test) {
-                return (launchOptions_.publicationFamily=="cheap" && test.skyMode>=4)
-                    || (launchOptions_.publicationFamily=="volumetric" && test.skyMode<4);
+                const std::string_view family=workloadFamily(test.skyMode);
+                return launchOptions_.publicationFamily!="all" && launchOptions_.publicationFamily!=family;
             });
-            if (launchOptions_.publicationSmoke) {
+            if (smoke) {
                 std::erase_if(cases, [](const PublicationCase& test) {
                     const bool keep=test.sweep=="timing" || test.sweep=="null"
-                        || test.sweep=="volume_budget" || (test.sweep=="image_quality" && test.step==1);
+                        || test.sweep=="volume_budget" || (test.sweep=="image_quality" && test.step==1)
+                        || (test.skyMode==7 && test.fieldScale>0.0f && test.skyRadius==30.0f);
                     return !keep || test.repeat>0;
                 });
                 for (auto& test : cases) {
@@ -1068,7 +1113,8 @@ namespace {
             output << ',' << workloadFamily(test.skyMode) << ','
                 << (volume ? VOLUME_BUDGET_IDS[test.volumeBudget] : "none") << ','
                 << (volume ? settings.cloudSamples : 0) << ',' << (volume ? settings.lightSamples : 0) << ','
-                << (volume ? settings.emptyStep : 0) << ',' << (test.skyMode==6 ? settings.auroraSamples : 0) << '\n';
+                << (volume ? settings.emptyStep : 0) << ',' << (test.skyMode==6 ? settings.auroraSamples : 0)
+                << ',' << (test.fieldScale>0.0f ? test.fieldScale : test.skyRadius) << '\n';
         }
 
         void preparePublicationFrame(const gfx::research::FrameInfo&) {
@@ -1084,6 +1130,8 @@ namespace {
             objectReflections_ = test.reflectionsEnabled;
             nullTest_ = test.nullTest;
             skyRadius_ = test.skyRadius;
+            fixedFieldScale_ = test.fieldScale>0.0f;
+            if (fixedFieldScale_) fieldScaleRadius_ = test.fieldScale;
             reflectiveSphereX_ = test.sphereX;
             camera_.set_target(cameraBaseTarget_ + glm::vec3(test.cameraOffsetX, 0.0f, 0.0f));
             animateSky_ = false;
@@ -1146,7 +1194,8 @@ namespace {
                 std::cout << "Publication suite complete. Analyze with: python tools/analyze_publication.py "
                           << publicationOutput_.string() << '\n';
                 stopPublicationSuite(true);
-                if (launchOptions_.publicationSuite || launchOptions_.publicationQuick || launchOptions_.publicationNullOnly || launchOptions_.publicationSmoke) close();
+                publicationMessage_ = publicationNullFailures_ ? "Completed with failed null checks." : "Benchmark complete.";
+                if (launchOptions_.runsPublication()) close();
             }
         }
 
@@ -1510,6 +1559,8 @@ namespace {
         glm::vec3 cameraBaseTarget_{0.0f, 0.95f, -0.55f};
         glm::vec3 skyCenter_{0.0f, 0.0f, 0.0f};
         float skyRadius_ = 6000.0f;
+        bool fixedFieldScale_ = false;
+        float fieldScaleRadius_ = 6000.0f;
         float sunElevation_ = 0.58f;
         float cloudCoverage_ = 0.52f;
         float cloudScale_ = 1.0f;
@@ -1539,6 +1590,7 @@ namespace {
         std::vector<double> publicationSamples_;
         ValidationResult publicationValidation_;
         std::filesystem::path publicationOutput_;
+        std::string publicationMessage_;
         std::ofstream publicationRaw_;
         std::ofstream publicationSummary_;
         std::ofstream publicationCaptures_;
@@ -1583,8 +1635,8 @@ namespace {
                 options.publicationSmoke = true;
             } else if (argument.starts_with("--publication-family=")) {
                 options.publicationFamily = std::string(argument.substr(21));
-                if (options.publicationFamily!="all" && options.publicationFamily!="cheap" && options.publicationFamily!="volumetric")
-                    throw std::runtime_error("publication-family must be all, cheap, or volumetric");
+                if (options.publicationFamily!="all" && options.publicationFamily!="cheap" && options.publicationFamily!="volumetric" && options.publicationFamily!="synthetic")
+                    throw std::runtime_error("publication-family must be all, cheap, volumetric, or synthetic");
             } else if (argument == "--publication-null-only") {
                 options.publicationNullOnly = true;
             } else if (argument.starts_with("--publication-output=")) {

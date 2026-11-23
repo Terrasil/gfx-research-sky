@@ -147,6 +147,31 @@ def write_rows(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def field_scale_analysis(root, summary):
+    captures = read_csv(root/"captures.csv")
+    paths = {r["case_id"]: resolve(root, r["pfm"]) for r in captures if r["pfm"]}
+    groups = defaultdict(dict)
+    for row in summary:
+        sweep = row["sweep"]
+        if sweep not in ("radius_fixed_scale","radius_coupled_scale") or row["case_id"] not in paths:
+            continue
+        key = row["sky_mode"], row["method"], row["width"], row["height"]
+        groups[key][float(row["sky_radius"]),sweep] = row
+    output = []
+    for (mode,method,width,height), cases in sorted(groups.items()):
+        anchor = cases.get((30.,"radius_fixed_scale"))
+        if not anchor:
+            raise ValueError(f"No fixed-field anchor for {mode}/{method}")
+        for radius, sweep in sorted(cases):
+            row = cases[radius,sweep]
+            m = hdr_metrics(paths[row["case_id"]], paths[anchor["case_id"]])
+            output.append(dict(sky_mode=mode,method=method,width=width,height=height,sky_radius=radius,
+                               field_scale=row["field_scale"],sweep=sweep,anchor_radius=30,
+                               rmse_vs_anchor=m["rmse"],maximum_absolute=m["max_abs"]))
+    if output:
+        write_rows(root/"field_scale_comparison.csv",output)
+
+
 def main() -> int:
     global DISPLAY_TRANSFER
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("results/publication")
@@ -154,6 +179,8 @@ def main() -> int:
     if manifest_path.is_file():
         metadata = dict(line.split("=", 1) for line in manifest_path.read_text().splitlines() if "=" in line)
         DISPLAY_TRANSFER = metadata.get("display_transfer", "linear")
+        if metadata.get("schema_version")=="3" and metadata.get("completed")!="1":
+            raise ValueError("The sky suite is incomplete")
     summary_path = root / "summary.csv"
     if not summary_path.is_file():
         raise SystemExit(f"Missing {summary_path}. Run the publication suite first.")
@@ -426,6 +453,8 @@ def main() -> int:
             })
     write_rows(root / "capture_quality.csv", capture_quality)
     write_rows(root / "null_results.csv", null_rows)
+    if (root/"captures.csv").is_file():
+        field_scale_analysis(root, summary)
 
     print(f"paired_cases,{len(paired_rows)}")
     print(f"timing_groups,{len(timing_aggregate)}")

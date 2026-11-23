@@ -80,7 +80,7 @@ float lomPhase(float cosine,float g) {
 }
 vec3 lomClouds(vec3 background,vec3 direction,vec3 samplePosition,float angularFootprint,bool night) {
     if(direction.y<=0.10 || uVolumeField.y<=0.0 || uVolumeField.z<=0.0) return background;
-    vec3 xi=(queryPosition(direction,samplePosition)-uSkyCenter)/max(uSkyRadius,1e-4);
+    vec3 xi=(queryPosition(direction,samplePosition)-uSkyCenter)/max(uFieldScaleRadius,1e-4);
     vec2 slope=direction.xz/max(direction.y,0.10);
     vec2 projected=(xi.xz+(vec2(0.35)-xi.yy)*slope)*uVolumeField.x;
     float originHeight=xi.y-direction.y;
@@ -88,7 +88,7 @@ vec3 lomClouds(vec3 background,vec3 direction,vec3 samplePosition,float angularF
     if(firstHeight>=1.0) return background;
     // Wind is in world units per second, matching the LOM coordinate convention.
     vec3 motion=vec3(uVolumeMotion.x,-uVolumeMotion.z,uVolumeMotion.y)
-        *(uTime*uVolumeField.x/max(uSkyRadius,1e-4));
+        *(uTime*uVolumeField.x/max(uFieldScaleRadius,1e-4));
     vec3 start=vec3(projected.x,0,projected.y)-motion;
     float thickness=uVolumeField.w*uVolumeField.x;
     vec3 segment=vec3(slope.x,1.0,slope.y)*thickness;
@@ -199,7 +199,7 @@ float auroraFootprint(vec2 horizontal,vec2 interval,float pixelRadius) {
     return footprint;
 }
 vec3 volumetricAurora(vec3 direction,vec3 samplePosition,float angularFootprint) {
-    vec3 q=(queryPosition(direction,samplePosition)-uSkyCenter)/max(uSkyRadius,1e-4);
+    vec3 q=(queryPosition(direction,samplePosition)-uSkyCenter)/max(uFieldScaleRadius,1e-4);
     vec3 origin=q-direction; // Equals (o-s0)/R for the origin-aware representation.
     float begin,end;
     if(!auroraInterval(origin,direction,begin,end) || uVolumeAuroraIntensity<=0.0) return vec3(0);

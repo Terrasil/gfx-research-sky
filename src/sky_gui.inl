@@ -27,7 +27,7 @@
         }
 
         void resetBenchmarkParameters() {
-            volume_={}; volumeBudgetUi_=1;
+            volume_={}; volumeBudgetUi_=1; fixedFieldScale_=false;
             sunElevation_=0.58f; cloudCoverage_=0.52f; cloudScale_=1.0f; cloudDensity_=1.0f;
             starIntensity_=1.0f; auroraIntensity_=1.15f; localInfluence_=1.0f; frozenTime_=12.0f;
             skyCenter_={0,0,0}; sphereRoughness_=0.05f; floorRoughness_=0.38f;
@@ -107,7 +107,11 @@
                 ImGui::Text("Case %zu / %zu",publicationCaseIndex_+1,publicationCases_.size());
                 ImGui::TextWrapped("%s",current.pairId.c_str());
                 ImGui::ProgressBar(float(publicationCaseIndex_)/float(publicationCases_.size()),{-1,0});
-                if (ImGui::Button("Stop benchmark",{-1,0})) stopPublicationSuite(false);
+                if (ImGui::Button("Stop benchmark",{-1,0})) {
+                    stopPublicationSuite(false);
+                    publicationMessage_ = "Benchmark stopped.";
+                    if (launchOptions_.runsPublication()) close();
+                }
             }
             ImGui::BeginDisabled(publicationRunning_);
             ImGui::SeparatorText("Environment");
@@ -126,13 +130,15 @@
                 if (ImGui::BeginTabItem("Sky")) {
                     if (parameterTable("sky-main")) {
                         parameter("Sampling R",[&]{ImGui::SliderFloat("##R",&skyRadius_,10,20000,"%.0f",ImGuiSliderFlags_Logarithmic);});
+                        parameter("Fixed field scale",[&]{ImGui::Checkbox("##lockfield",&fixedFieldScale_);});
+                        if(fixedFieldScale_) parameter("Field scale distance",[&]{ImGui::SliderFloat("##fieldR",&fieldScaleRadius_,10,20000,"%.0f",ImGuiSliderFlags_Logarithmic);});
                         parameter("Field anchor",[&]{ImGui::DragFloat3("##center",&skyCenter_.x,0.1f);});
                         parameter("Sun / moon height",[&]{ImGui::SliderAngle("##sun",&sunElevation_,5,85);});
                         parameter("Animate",[&]{ImGui::Checkbox("##animate",&animateSky_);});
                         if(!animateSky_) parameter("Frozen time",[&]{ImGui::SliderFloat("##time",&frozenTime_,0,120,"%.1f s");});
                         ImGui::EndTable();
                     }
-                    if(skyMode_>=4) drawVolumeGui();
+                    if(skyMode_>=4 && skyMode_<=6) drawVolumeGui();
                     else if(parameterTable("cheap-sky")) {
                         if(skyMode_==0 || skyMode_==1) {
                             parameter("Cloud coverage",[&]{ImGui::SliderFloat("##coverage",&cloudCoverage_,0,1,"%.3f");});
@@ -142,12 +148,13 @@
                         if(skyMode_==2) parameter("Aurora intensity",[&]{ImGui::SliderFloat("##aurora",&auroraIntensity_,0,3,"%.3f");});
                         ImGui::EndTable();
                     }
-                    if(skyMode_==1 || skyMode_==2 || skyMode_>=5) {
+                    if(skyMode_==1 || skyMode_==2 || (skyMode_>=5 && skyMode_<=6)) {
                         if(parameterTable("stars")) {
                             parameter("Star intensity",[&]{ImGui::SliderFloat("##stars",&starIntensity_,0,3,"%.3f");});
                             ImGui::EndTable();
                         }
                     }
+                    if(skyMode_==7) ImGui::TextWrapped("Uniform extinction with sinusoidal emission. The analytic reference is evaluated by tools/validate_slab.py.");
                     if(skyMode_==3) ImGui::TextWrapped("Deterministic world-space bands and checker cells.");
                     ImGui::EndTabItem();
                 }
@@ -186,16 +193,30 @@
                         parameter("Local influence",[&]{ImGui::SliderFloat("##influence",&localInfluence_,0,1,"%.3f");});
                         parameter("Record timing CSV",[&]{ImGui::Checkbox("##record",&record_);});
                         parameter("Suite family",[&]{
-                            const char* choices[]{"All variants","Cheap + synthetic","Volumetric"};
-                            int family=launchOptions_.publicationFamily=="cheap" ? 1 : (launchOptions_.publicationFamily=="volumetric" ? 2 : 0);
-                            if(ImGui::Combo("##family",&family,choices,3)) launchOptions_.publicationFamily=family==1 ? "cheap" : (family==2 ? "volumetric" : "all");
+                            const char* choices[]{"All variants", "Cheap", "Volumetric", "Synthetic"};
+                            constexpr std::array<std::string_view, 4> families{"all", "cheap", "volumetric", "synthetic"};
+                            const auto selected = std::find(families.begin(), families.end(), launchOptions_.publicationFamily);
+                            int family = static_cast<int>(selected - families.begin());
+                            if (ImGui::Combo("##family", &family, choices, IM_ARRAYSIZE(choices)))
+                                launchOptions_.publicationFamily = families[family];
                         });
                         ImGui::EndTable();
                     }
-                    ImGui::TextWrapped("A suite resets scene and field parameters to documented defaults.");
-                    ImGui::TextWrapped("Output: %s",launchOptions_.publicationOutput.string().c_str());
-                    if(ImGui::Button("Run quick suite",{-1,0})) startPublicationSuite(false);
-                    if(ImGui::Button("Run full suite",{-1,0})) startPublicationSuite(true);
+                    ImGui::SeparatorText("Publication benchmarks");
+                    const auto launch = [&](const char* label, bool full, bool smoke = false, bool nullOnly = false) {
+                        if (!ImGui::Button(label, {-1, 0})) return;
+                        try {
+                            startPublicationSuite(full, smoke, nullOnly);
+                        } catch (const std::exception& error) {
+                            publicationMessage_ = error.what();
+                        }
+                    };
+                    launch("Run smoke test", false, true);
+                    launch("Run quick suite", false);
+                    launch("Run full suite", true);
+                    launch("Run null checks", true, false, true);
+                    if (!publicationMessage_.empty()) ImGui::TextWrapped("%s", publicationMessage_.c_str());
+                    if (!publicationOutput_.empty()) ImGui::TextWrapped("Output: %s", publicationOutput_.string().c_str());
                     ImGui::EndTabItem();
                 }
                 ImGui::EndTabBar();

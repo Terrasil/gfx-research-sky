@@ -100,7 +100,7 @@ class Renderer:
         self.ctx.disable(gl.DEPTH_TEST); self.post_fbo.use()
         for unit,tex in enumerate([self.gbuffer[0],self.gbuffer[1],self.depth,self.gbuffer[2],*self.noise]): tex.use(unit)
         a,n=atmosphere()
-        uniforms={"uEye":tuple(eye),"uSkyCenter":(0,0,0),"uSkyRadius":radius,"uSunElevation":0.58,
+        uniforms={"uEye":tuple(eye),"uSkyCenter":(0,0,0),"uSkyRadius":radius,"uFieldScaleRadius":radius,"uSunElevation":0.58,
             "uCloudCoverage":0.52,"uCloudScale":1.0,"uCloudDensity":1.0,"uStarIntensity":1.0,"uAuroraIntensity":1.15,
             "uLocalInfluence":influence,"uTime":12.0,"uSkyMode":mode,"uMethod":method,"uObjectReflections":1,
             "uVolumeBudget":[(32,3,2,64),(64,6,2,128),(128,12,2,256)][budget],"uVolumeField":(1.25,coverage,2.0,0.28),

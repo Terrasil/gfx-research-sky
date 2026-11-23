@@ -13,6 +13,7 @@ uniform mat4 uInvViewProjection;
 uniform vec3 uEye;
 uniform vec3 uSkyCenter;
 uniform float uSkyRadius;
+uniform float uFieldScaleRadius;
 uniform float uSunElevation;
 uniform float uCloudCoverage;
 uniform float uCloudScale;
@@ -99,7 +100,7 @@ float cloudField(vec3 rayDir, vec3 samplePosition) {
     vec3 query = queryPosition(rayDir, samplePosition);
     float scale = max(uCloudScale, 0.05);
     vec3 wind = vec3(uTime * 0.018, uTime * 0.006, -uTime * 0.012);
-    vec3 p = ((query - uSkyCenter) / max(uSkyRadius, 1e-4)) * (4.7 * scale) + wind;
+    vec3 p = ((query - uSkyCenter) / max(uFieldScaleRadius, 1e-4)) * (4.7 * scale) + wind;
 
     float broad = fbm(p);
     float erosion = fbm(p * 2.35 + vec3(23.4, -8.1, 41.7));
@@ -113,7 +114,7 @@ float cloudField(vec3 rayDir, vec3 samplePosition) {
 float cloudEdge(vec3 rayDir, vec3 samplePosition) {
     vec3 query = queryPosition(rayDir, samplePosition);
     float scale = max(uCloudScale, 0.05);
-    vec3 p = (query - uSkyCenter) / max(uSkyRadius, 1e-4);
+    vec3 p = (query - uSkyCenter) / max(uFieldScaleRadius, 1e-4);
     float coarse = fbm(p * (4.5 * scale));
     float fine = fbm(p * (8.2 * scale) + vec3(8.0, 31.0, -15.0));
     return clamp((coarse - fine * 0.34) * 1.15, 0.0, 1.0);
@@ -229,7 +230,7 @@ vec3 aurora(vec3 rayDir, vec3 samplePosition) {
 }
 
 vec3 syntheticWorldField(vec3 rayDir, vec3 samplePosition) {
-    vec3 q = (queryPosition(rayDir, samplePosition) - uSkyCenter) / max(uSkyRadius, 1e-4);
+    vec3 q = (queryPosition(rayDir, samplePosition) - uSkyCenter) / max(uFieldScaleRadius, 1e-4);
     vec3 bands = 0.5 + 0.5 * sin(vec3(11.0 * q.x + 3.0 * q.z, 9.0 * q.y - 4.0 * q.x, 13.0 * q.z + 2.0 * q.y));
     float cells = mod(floor((q.x + 2.0) * 6.0) + floor((q.z + 2.0) * 6.0), 2.0);
     vec3 checker = mix(vec3(0.10, 0.18, 0.72), vec3(0.95, 0.38, 0.08), cells);
@@ -238,8 +239,36 @@ vec3 syntheticWorldField(vec3 rayDir, vec3 samplePosition) {
 
 #include "volume.glsl"
 
+// Emitting y-slab in units of the independent spatial field scale S.
+vec3 analyticSlab(vec3 rayDir, vec3 samplePosition) {
+    vec3 origin = (queryPosition(rayDir,samplePosition)-uSkyCenter-uSkyRadius*rayDir)
+                / max(uFieldScaleRadius,1e-4);
+    const vec3 background=vec3(.06,.12,.24);
+    float start=0.0, end=4.0;
+    if (abs(rayDir.y)<1e-6) {
+        if (origin.y<.2 || origin.y>.8) return background;
+    } else {
+        vec2 t=(vec2(.2,.8)-origin.y)/rayDir.y;
+        start=max(start,min(t.x,t.y));
+        end=min(end,max(t.x,t.y));
+        if (end<=start) return background;
+    }
+    int steps=clamp(uVolumeBudget.x,16,256);
+    float ds=(end-start)/float(steps);
+    float transmission=exp(-.8*ds);
+    float transmittance=1.0, radiance=0.0;
+    for (int i=0;i<steps;++i) {
+        vec3 p=origin+(start+(float(i)+.5)*ds)*rayDir;
+        float source=.65+.30*cos(7.0*p.x+2.0*p.z);
+        radiance+=transmittance*(1.0-transmission)*source;
+        transmittance*=transmission;
+    }
+    return transmittance*background+radiance*vec3(1.0,.64,.35);
+}
+
 vec3 proceduralSky(vec3 rayDir, vec3 samplePosition, float angularFootprint) {
     rayDir = normalize(rayDir);
+    if (uSkyMode == 7) return analyticSlab(rayDir,samplePosition);
     if (uSkyMode >= 4) {
         bool night = uSkyMode != 4;
         vec3 background = night ? nightBase(rayDir, samplePosition, false) : lomAtmosphere(rayDir);
